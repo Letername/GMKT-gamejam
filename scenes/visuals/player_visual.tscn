@@ -1,0 +1,6 @@
+[gd_scene format=3]
+
+[node name="PlayerVisual" type="Node2D"]
+
+[node name="Body" type="Sprite2D" parent="."]
+centered = false

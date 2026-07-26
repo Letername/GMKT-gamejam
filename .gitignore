@@ -1,0 +1,44 @@
+# Godot-generated project data
+/.godot/
+/.import/
+/.mono/
+.nomedia
+*.import
+*.translation
+export.cfg
+export_credentials.cfg
+data_*/
+mono_crash.*.json
+
+# Local Godot editor/runtime data and downloaded tooling
+/.tools/
+/export_templates/
+/feature_profiles/
+/script_templates/
+/text_editor_themes/
+
+# Exported builds and test output
+/Build/
+
+# Local helper output and transfer scratch space
+/.codex_tmp_*/
+/.tmp.drive*/
+/.claude/settings.local.json
+
+# Local backup and temporary files
+*.pre-bugfix-backup
+*.tmp
+*.temp
+*.bak
+*.log
+*~
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local environment files (keep shareable examples)
+.env
+.env.*
+!.env.example
