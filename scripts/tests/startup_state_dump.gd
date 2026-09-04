@@ -20,4 +20,8 @@ func _run() -> void:
 	print("near_cave=", main_scene._is_player_near_cave_entrance())
 	print("near_house=", main_scene._is_player_near_house_door())
 	print("house_texture_active=", main_scene._current_house_texture() != null)
+	main_scene.queue_free()
+	main_scene = null
+	await process_frame
+	await process_frame
 	quit()
