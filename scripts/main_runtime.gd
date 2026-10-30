@@ -4,6 +4,9 @@ extends Node2D
 # TUNABLE BALANCE CONSTANTS
 # -------------------------------------------------------------------
 const SCREEN_SIZE := Vector2(1280, 720)
+const REPLAY_GAME_VERSION := "tax-season-siege-1.3.4"
+const REPLAY_HASH_INTERVAL := 30
+const LEADERBOARD_BASE_URL := "https://tax-season-siege-leaderboard.danaildimitrov07.chatgpt.site"
 const CELL_SIZE := 48.0
 const GRID_ORIGIN := Vector2(144, 96)
 const GRID_SIZE := Vector2i(24, 18)
@@ -200,6 +203,18 @@ const PLAYER_SKID_TIME := 0.16
 const MOTION_SPARK_TIME := 0.42
 const SLASH_TRAIL_TIME := 0.24
 const PHASE_TRANSITION_TIME := 0.46
+# Player-chosen UI motion length (pick sheet, 2026-10-29): about 460 ms.
+const UI_ANIM_TIME := 0.46
+const UI_STAMP_TIME := 0.46
+const UI_IRIS_TIME := 0.7
+const DAMAGE_CRIT_THRESHOLD := 6
+const UI_PAPER_FILL := Color(0.94, 0.89, 0.77)
+const UI_PAPER_INK := Color(0.17, 0.14, 0.09)
+const UI_PAPER_CARD := Color(0.99, 0.96, 0.88)
+const UI_PAPER_MUTED := Color(0.40, 0.34, 0.25)
+const UI_STAMP_LIFE := 0.9
+const UI_FONT_PATH := "res://assets/fonts/Silkscreen-Regular.ttf"
+const UI_STAMP_RED := Color(0.78, 0.23, 0.20)
 const TURRET_BUILD_TIME := 2.2
 const SELL_REFUND_RATIO := 0.5
 const MENU_MUSIC_VOLUME_DB := -10.0
@@ -221,6 +236,8 @@ const TEAM_INTRO_PATH := "res://assets/intro/foundry_eight_intro.ogv"
 const TEAM_INTRO_FADE_IN_TIME := 0.45
 const TEAM_INTRO_FADE_OUT_TIME := 0.38
 const TEAM_INTRO_SKIP_HINT_DELAY := 0.65
+const REVIVE_OFFER_DELAY := 1.35
+const REVIVE_OFFER_DURATION := 10.0
 const GAMEPLAY_MUSIC_TITLES := ["A risky trek.", "Spaceflight", "we. all. lain."]
 const GAMEPLAY_MUSIC_ARTISTS := ["SovieticoOfficial", "SovieticoOfficial & Vista Sounds", "SovieticoOfficial"]
 const MUSIC_CREDIT_LINKS := [
@@ -508,6 +525,8 @@ const UI_PANEL_RADIUS := 12
 
 enum Phase { MENU, BUILD, DEFEND, GAME_OVER }
 enum StructureType { NONE, TURRET, WALL_LIGHT, WALL_MEDIUM, WALL_HEAVY }
+enum ReplayMode { OFF, RECORD, PLAYBACK }
+signal replay_requested(run_id: String, entry_id: String)
 
 const PLAYER_VISUAL_SCENE := preload("res://scenes/visuals/player_visual.tscn")
 const DEALER_VISUAL_SCENE := preload("res://scenes/visuals/dealer_visual.tscn")
@@ -515,6 +534,29 @@ const TURRET_VISUAL_SCENE := preload("res://scenes/visuals/turret_visual.tscn")
 const ENEMY_VISUAL_SCENE := preload("res://scenes/visuals/enemy_visual.tscn")
 
 var phase := Phase.MENU
+var simulation_rng := RandomNumberGenerator.new()
+var replay_tape: RefCounted
+var replay_mode := ReplayMode.OFF
+var replay_frame_index := 0
+var replay_run_seed := 0
+var replay_diverged := false
+var replay_divergence_tick := -1
+var replay_input_actions: Array[String] = []
+var replay_mouse_position := Vector2.ZERO
+var replay_pending_events: Array[Dictionary] = []
+var replay_injecting_event := false
+var replay_gui_dispatching := false
+var replay_recording_error := ""
+var replay_was_persistence_enabled := true
+var replay_pre_playback_metadata: Dictionary = {}
+var replay_last_run_id := ""
+var replay_last_path := ""
+var replay_playback_paused := false
+var replay_playback_speed := 1.0
+var replay_playback_accumulator := 0.0
+var replay_seek_in_progress := false
+var replay_used_dev_mode := false
+var leaderboard_host: Node
 var round_number := 1
 var highest_round := 1
 var countdown := BUILD_PHASE_DURATION
@@ -663,6 +705,7 @@ var menu_start_button: Button
 var menu_settings_button: Button
 var menu_tutorial_button: Button
 var menu_dev_button: Button
+var menu_leaderboard_button: Button
 var menu_credits_button: Button
 var menu_continue_hint_label: Label
 var menu_info_label: Label
@@ -701,6 +744,10 @@ var escape_confirm_panel: ColorRect
 var escape_confirm_title_label: Label
 var escape_confirm_body_label: Label
 var escape_confirm_hint_label: Label
+var revive_offer_panel: ColorRect
+var revive_offer_countdown_label: Label
+var revive_offer_watch_button: Button
+var revive_offer_decline_button: Button
 var player_body_texture: Texture2D
 var player_idle_left_1_texture: Texture2D
 var player_idle_left_2_texture: Texture2D
@@ -790,6 +837,7 @@ var menu_background_texture: Texture2D
 var menu_background_frames: Array[Texture2D] = []
 var menu_ui_texture: Texture2D
 var loss_screen_texture: Texture2D
+var loss_screen_used_rect := Rect2()
 var backyard_fence_texture: Texture2D
 var cave_boss_texture: Texture2D
 var cave_boss_attack_texture: Texture2D
@@ -821,6 +869,16 @@ var player_step_effect_timer := 0.0
 var warning_sfx_cooldown := 0.0
 var phase_transition_timer := 0.0
 var phase_transition_color := Color(0.96, 0.82, 0.44)
+# Cosmetic-only UI motion; never part of replay state hashes.
+var ui_last_phase := -1
+var menu_title_stamp_elapsed := 99.0
+var iris_open_timer := 0.0
+var hp_flinch_timer := 0.0
+var ui_paper_active := false
+var ui_panel_xform := Transform2D.IDENTITY
+var ui_panel_was_open := false
+var ui_panel_open_elapsed := 0.0
+var ui_stamps: Array = []
 var wave_banner_duration := WAVE_BANNER_TIME
 var dealer_status_text := "The arms dealer trades in dollars."
 var energy_drink_timer := 0.0
@@ -881,6 +939,12 @@ var enemy_visual_nodes := {}
 var enemy_cluster_counts := {}
 var enemy_cluster_cache_timer := 0.0
 var graceful_shutdown_started := false
+var revive_used := false
+var revive_offer_pending := false
+var revive_offer_visible := false
+var revive_offer_delay := 0.0
+var revive_offer_countdown := 0.0
+var ad_in_progress := false
 
 @onready var visual_layer: Node2D = $VisualLayer
 @onready var player_visual_node: Node2D = $VisualLayer/PlayerVisual
@@ -895,16 +959,25 @@ var graceful_shutdown_started := false
 
 func _ready() -> void:
 	get_tree().auto_accept_quit = false
+	_apply_ui_font()
 	_load_persistent_settings()
 	_apply_window_mode()
 	# Keep the team's protected developer menu available in normal builds.
 	# The PIN gate still prevents it from being enabled accidentally.
 	dev_tools_available = true
 	randomize()
+	simulation_rng.randomize()
 	_ensure_input_actions()
+	replay_input_actions.clear()
+	for action in InputMap.get_actions():
+		replay_input_actions.append(String(action))
+	replay_input_actions.sort()
 	_load_art_assets()
 	_build_audio_players()
 	_build_hud()
+	_paperize_settings_panel()
+	_connect_ad_service()
+	_setup_leaderboard_host()
 	_connect_ui_audio_feedback(self)
 	_reset_static_layout()
 	_setup_visual_nodes()
@@ -916,6 +989,504 @@ func _ready() -> void:
 	_refresh_hud()
 	if menu_start_button != null:
 		menu_start_button.call_deferred("grab_focus")
+
+
+func start_replay_recording(seed_value: int = -1) -> bool:
+	if replay_mode == ReplayMode.PLAYBACK:
+		return false
+	if replay_tape == null:
+		replay_tape = load("res://scripts/replay/replay_tape.gd").new()
+	replay_run_seed = seed_value if seed_value >= 0 else int(Time.get_ticks_usec() % 9007199254740991)
+	if not replay_tape.begin(REPLAY_GAME_VERSION, replay_run_seed, 60, _capture_replay_metadata()):
+		return false
+	replay_mode = ReplayMode.RECORD
+	replay_frame_index = 0
+	replay_diverged = false
+	replay_divergence_tick = -1
+	replay_recording_error = ""
+	replay_pending_events.clear()
+	replay_last_run_id = _new_replay_run_id()
+	replay_used_dev_mode = dev_mode_enabled
+	replay_mouse_position = get_viewport().get_mouse_position() if is_inside_tree() else Vector2.ZERO
+	_start_new_game()
+	return true
+
+
+func finish_replay_recording() -> PackedByteArray:
+	if replay_mode != ReplayMode.RECORD or replay_tape == null:
+		return PackedByteArray()
+	replay_mode = ReplayMode.OFF
+	var encoded: PackedByteArray = replay_tape.encode()
+	if encoded.is_empty():
+		replay_recording_error = "Recording could not be finalized: compressed replay exceeded the 5 MiB limit or was invalid."
+		return PackedByteArray()
+	if not _save_replay_artifact(encoded):
+		replay_recording_error = "Replay bytes were recorded but could not be saved locally."
+		return PackedByteArray()
+	return encoded
+
+
+func start_replay_playback(encoded_tape: PackedByteArray) -> bool:
+	var candidate = load("res://scripts/replay/replay_tape.gd").new()
+	var recording: Dictionary = candidate.decode(encoded_tape)
+	if recording.is_empty():
+		printerr("REPLAY_LOAD_REJECTED invalid tape; bytes=", encoded_tape.size(), " reason=", candidate.last_decode_error)
+		return false
+	if String(recording.get("game_version", "")) != REPLAY_GAME_VERSION:
+		printerr("REPLAY_LOAD_REJECTED replay game version mismatch")
+		return false
+	if not candidate.load_playback(recording):
+		return false
+	replay_pre_playback_metadata = _capture_replay_metadata()
+	replay_tape = candidate
+	replay_mode = ReplayMode.PLAYBACK
+	replay_run_seed = int(recording["seed"])
+	replay_frame_index = 0
+	replay_diverged = false
+	replay_divergence_tick = -1
+	replay_playback_paused = false
+	replay_playback_speed = 1.0
+	replay_playback_accumulator = 0.0
+	replay_mouse_position = Vector2(recording.get("metadata", {}).get("mouse", [0.0, 0.0])[0], recording.get("metadata", {}).get("mouse", [0.0, 0.0])[1])
+	replay_pending_events.clear()
+	replay_was_persistence_enabled = persistence_enabled
+	persistence_enabled = false
+	_apply_replay_metadata(recording.get("metadata", {}))
+	_start_new_game()
+	return true
+
+
+func seek_replay(target_tick: int) -> bool:
+	if replay_mode != ReplayMode.PLAYBACK or replay_tape == null or target_tick < 0 or target_tick > replay_tape.data["frames"].size():
+		return false
+	if not replay_tape.seek(0):
+		return false
+	replay_frame_index = 0
+	replay_diverged = false
+	replay_divergence_tick = -1
+	replay_playback_paused = false
+	replay_playback_speed = 1.0
+	replay_playback_accumulator = 0.0
+	var metadata: Dictionary = replay_tape.data.get("metadata", {})
+	var initial_mouse: Array = metadata.get("mouse", [0.0, 0.0])
+	replay_mouse_position = Vector2(initial_mouse[0], initial_mouse[1])
+	_apply_replay_metadata(metadata)
+	_start_new_game()
+	replay_seek_in_progress = true
+	for _step in range(target_tick):
+		_process(0.0)
+		if replay_diverged:
+			replay_seek_in_progress = false
+			return false
+	replay_seek_in_progress = false
+	return true
+
+
+func seek_replay_to_wave(wave: int) -> bool:
+	if replay_tape == null or wave < 1:
+		return false
+	var tick: int = replay_tape.marker_tick("wave", wave - 1)
+	return tick >= 0 and seek_replay(tick)
+
+
+func set_replay_paused(paused: bool) -> void:
+	if replay_mode == ReplayMode.PLAYBACK:
+		replay_playback_paused = paused
+
+
+func set_replay_speed(speed: float) -> void:
+	if replay_mode == ReplayMode.PLAYBACK and is_finite(speed):
+		replay_playback_speed = clampf(speed, 0.1, 4.0)
+
+
+func stop_replay_playback() -> void:
+	if replay_mode == ReplayMode.PLAYBACK:
+		replay_mode = ReplayMode.OFF
+		persistence_enabled = replay_was_persistence_enabled
+		replay_playback_paused = false
+		replay_playback_speed = 1.0
+		replay_playback_accumulator = 0.0
+		_apply_replay_metadata(replay_pre_playback_metadata)
+
+
+func _capture_replay_metadata() -> Dictionary:
+	var mouse := get_viewport().get_mouse_position() if is_inside_tree() else Vector2.ZERO
+	return {
+		"dev_mode": dev_mode_enabled,
+		"dev_invincible": dev_invincible_enabled,
+		"dev_speed": dev_speed_percent,
+		"tutorial_enabled": tutorial_enabled,
+		"effects_high": effects_quality_high,
+		"shake_percent": screen_shake_percent,
+		"gun_unlocked": persistent_gun_sentry_unlocked,
+		"golden_unlocked": persistent_golden_sentry_unlocked,
+		"magic_unlocked": persistent_magic_sentry_unlocked,
+		"shield_unlocked": persistent_shield_unlocked,
+		"mouse": [mouse.x, mouse.y]
+	}
+
+
+func _apply_replay_metadata(metadata: Dictionary) -> void:
+	dev_mode_enabled = bool(metadata.get("dev_mode", false))
+	dev_invincible_enabled = bool(metadata.get("dev_invincible", false))
+	dev_speed_percent = clampf(float(metadata.get("dev_speed", 100.0)), 25.0, 400.0)
+	tutorial_enabled = bool(metadata.get("tutorial_enabled", true))
+	effects_quality_high = bool(metadata.get("effects_high", true))
+	screen_shake_percent = clampf(float(metadata.get("shake_percent", 100.0)), 0.0, 150.0)
+	persistent_gun_sentry_unlocked = bool(metadata.get("gun_unlocked", false))
+	persistent_golden_sentry_unlocked = bool(metadata.get("golden_unlocked", false))
+	persistent_magic_sentry_unlocked = bool(metadata.get("magic_unlocked", false))
+	persistent_shield_unlocked = bool(metadata.get("shield_unlocked", true))
+	if leaderboard_host != null:
+		leaderboard_host.set_dev_mode_active(dev_mode_enabled)
+
+
+func _new_replay_run_id() -> String:
+	var hex := Crypto.new().generate_random_bytes(16).hex_encode()
+	hex = hex.substr(0, 12) + "4" + hex.substr(13)
+	hex = hex.substr(0, 16) + "8" + hex.substr(17)
+	return "%s-%s-%s-%s-%s" % [hex.substr(0, 8), hex.substr(8, 4), hex.substr(12, 4), hex.substr(16, 4), hex.substr(20, 12)]
+
+
+func _save_replay_artifact(encoded: PackedByteArray) -> bool:
+	if replay_last_run_id.is_empty() or encoded.is_empty() or encoded.size() > 5 * 1024 * 1024:
+		return false
+	if DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path("user://replays")) != OK:
+		return false
+	replay_last_path = "user://replays/%s.tsr" % replay_last_run_id
+	var file := FileAccess.open(replay_last_path, FileAccess.WRITE)
+	if file == null:
+		return false
+	file.store_buffer(encoded)
+	file.flush()
+	file.close()
+	return FileAccess.file_exists(replay_last_path)
+
+
+func _finalize_run_after_game_over() -> void:
+	if replay_mode != ReplayMode.RECORD:
+		return
+	var used_dev := replay_used_dev_mode or dev_mode_enabled
+	finish_replay_recording()
+	if leaderboard_host != null:
+		leaderboard_host.set_dev_mode_active(dev_mode_enabled)
+		leaderboard_host.open_game_over(round_number, replay_last_run_id, round_number, replay_last_path, used_dev)
+
+
+func _setup_leaderboard_host() -> void:
+	var host_script = load("res://scripts/leaderboard/leaderboard_host.gd")
+	if host_script == null:
+		return
+	leaderboard_host = host_script.new()
+	leaderboard_host.name = "LeaderboardHost"
+	add_child(leaderboard_host)
+	if not leaderboard_host.setup(self, LEADERBOARD_BASE_URL):
+		leaderboard_host.queue_free()
+		leaderboard_host = null
+		return
+	leaderboard_host.set_dev_mode_active(dev_mode_enabled)
+	leaderboard_host.replay_open_requested.connect(_on_leaderboard_replay_open_requested)
+	leaderboard_host.replay_downloaded.connect(_on_leaderboard_replay_downloaded)
+	leaderboard_host.replay_download_failed.connect(_on_leaderboard_replay_download_failed)
+
+
+func _on_leaderboard_replay_open_requested(run_id: String, entry_id: String) -> void:
+	replay_requested.emit(run_id, entry_id)
+	if phase != Phase.MENU and phase != Phase.GAME_OVER:
+		_on_leaderboard_replay_download_failed(run_id, "Close the current run before opening a shared replay.")
+		return
+	if not leaderboard_host.download_replay(run_id):
+		_on_leaderboard_replay_download_failed(run_id, "The replay download could not be started.")
+
+
+func _on_leaderboard_replay_downloaded(run_id: String, bytes: PackedByteArray) -> void:
+	if phase != Phase.MENU and phase != Phase.GAME_OVER:
+		_on_leaderboard_replay_download_failed(run_id, "Close the current run before opening a shared replay.")
+		return
+	if not start_replay_playback(bytes):
+		_on_leaderboard_replay_download_failed(run_id, "The downloaded replay is invalid or was made by a different game version.")
+		return
+	leaderboard_host.close_panel()
+
+
+func _on_leaderboard_replay_download_failed(run_id: String, message: String) -> void:
+	replay_recording_error = "Replay %s: %s" % [run_id, message]
+	if leaderboard_host != null:
+		leaderboard_host._update_snapshot("error", message)
+
+
+func _on_menu_leaderboard_pressed() -> void:
+	if leaderboard_host != null:
+		leaderboard_host.open_menu()
+
+
+func _capture_replay_inputs() -> Dictionary:
+	var held: Array[String] = []
+	var strengths := {}
+	for action in replay_input_actions:
+		var strength := Input.get_action_strength(action)
+		if Input.is_action_pressed(action) or strength > 0.0:
+			held.append(action)
+			strengths[action] = clampf(strength, 0.0, 1.0)
+	return {"held": held, "strengths": strengths}
+
+
+func _serialize_replay_input_event(event: InputEvent) -> Dictionary:
+	var base := {"device": event.device}
+	if event is InputEventKey:
+		var key := event as InputEventKey
+		base.merge({"type": "key", "keycode": key.keycode, "physical": key.physical_keycode, "label": key.key_label, "unicode": key.unicode, "pressed": key.pressed, "echo": key.echo, "alt": key.alt_pressed, "shift": key.shift_pressed, "ctrl": key.ctrl_pressed, "meta": key.meta_pressed, "location": key.location}, true)
+	elif event is InputEventMouseButton:
+		var button := event as InputEventMouseButton
+		base.merge({"type": "mouse_button", "button": button.button_index, "pressed": button.pressed, "double": button.double_click, "factor": button.factor, "position": [button.position.x, button.position.y], "global_position": [button.global_position.x, button.global_position.y]}, true)
+	elif event is InputEventMouseMotion:
+		var motion := event as InputEventMouseMotion
+		base.merge({"type": "mouse_motion", "position": [motion.position.x, motion.position.y], "global_position": [motion.global_position.x, motion.global_position.y], "relative": [motion.relative.x, motion.relative.y], "velocity": [motion.velocity.x, motion.velocity.y], "button_mask": motion.button_mask, "pressure": motion.pressure, "tilt": [motion.tilt.x, motion.tilt.y]}, true)
+	elif event is InputEventJoypadButton:
+		var button := event as InputEventJoypadButton
+		base.merge({"type": "joy_button", "button": button.button_index, "pressed": button.pressed, "pressure": button.pressure}, true)
+	elif event is InputEventJoypadMotion:
+		var motion := event as InputEventJoypadMotion
+		base.merge({"type": "joy_motion", "axis": motion.axis, "value": motion.axis_value}, true)
+	elif event is InputEventScreenTouch:
+		var touch := event as InputEventScreenTouch
+		base.merge({"type": "touch", "index": touch.index, "pressed": touch.pressed, "double": touch.double_tap, "position": [touch.position.x, touch.position.y]}, true)
+	elif event is InputEventScreenDrag:
+		var drag := event as InputEventScreenDrag
+		base.merge({"type": "screen_drag", "index": drag.index, "position": [drag.position.x, drag.position.y], "relative": [drag.relative.x, drag.relative.y], "velocity": [drag.velocity.x, drag.velocity.y], "pressure": drag.pressure, "tilt": [drag.tilt.x, drag.tilt.y]}, true)
+	elif event is InputEventAction:
+		var action := event as InputEventAction
+		base.merge({"type": "action", "action": String(action.action), "pressed": action.pressed, "strength": action.strength}, true)
+	else:
+		return {}
+	return base
+
+
+func _deserialize_replay_input_event(data: Dictionary) -> InputEvent:
+	var event: InputEvent
+	match String(data.get("type", "")):
+		"key":
+			var key := InputEventKey.new()
+			key.keycode = int(data.get("keycode", 0))
+			key.physical_keycode = int(data.get("physical", 0))
+			key.key_label = int(data.get("label", 0))
+			key.unicode = int(data.get("unicode", 0))
+			key.pressed = bool(data.get("pressed", false))
+			key.echo = bool(data.get("echo", false))
+			key.alt_pressed = bool(data.get("alt", false))
+			key.shift_pressed = bool(data.get("shift", false))
+			key.ctrl_pressed = bool(data.get("ctrl", false))
+			key.meta_pressed = bool(data.get("meta", false))
+			key.location = int(data.get("location", 0))
+			event = key
+		"mouse_button":
+			var button := InputEventMouseButton.new()
+			button.button_index = int(data.get("button", MOUSE_BUTTON_LEFT))
+			button.pressed = bool(data.get("pressed", false))
+			button.double_click = bool(data.get("double", false))
+			button.factor = float(data.get("factor", 1.0))
+			button.position = Vector2(data.get("position", [0.0, 0.0])[0], data.get("position", [0.0, 0.0])[1])
+			button.global_position = Vector2(data.get("global_position", [0.0, 0.0])[0], data.get("global_position", [0.0, 0.0])[1])
+			event = button
+		"mouse_motion":
+			var motion := InputEventMouseMotion.new()
+			motion.position = Vector2(data.get("position", [0.0, 0.0])[0], data.get("position", [0.0, 0.0])[1])
+			motion.global_position = Vector2(data.get("global_position", [0.0, 0.0])[0], data.get("global_position", [0.0, 0.0])[1])
+			motion.relative = Vector2(data.get("relative", [0.0, 0.0])[0], data.get("relative", [0.0, 0.0])[1])
+			motion.velocity = Vector2(data.get("velocity", [0.0, 0.0])[0], data.get("velocity", [0.0, 0.0])[1])
+			motion.button_mask = int(data.get("button_mask", 0))
+			motion.pressure = float(data.get("pressure", 0.0))
+			motion.tilt = Vector2(data.get("tilt", [0.0, 0.0])[0], data.get("tilt", [0.0, 0.0])[1])
+			event = motion
+		"joy_button":
+			var button := InputEventJoypadButton.new()
+			button.button_index = int(data.get("button", 0))
+			button.pressed = bool(data.get("pressed", false))
+			button.pressure = float(data.get("pressure", 0.0))
+			event = button
+		"joy_motion":
+			var motion := InputEventJoypadMotion.new()
+			motion.axis = int(data.get("axis", 0))
+			motion.axis_value = float(data.get("value", 0.0))
+			event = motion
+		"touch":
+			var touch := InputEventScreenTouch.new()
+			touch.index = int(data.get("index", 0))
+			touch.pressed = bool(data.get("pressed", false))
+			touch.double_tap = bool(data.get("double", false))
+			touch.position = Vector2(data.get("position", [0.0, 0.0])[0], data.get("position", [0.0, 0.0])[1])
+			event = touch
+		"screen_drag":
+			var drag := InputEventScreenDrag.new()
+			drag.index = int(data.get("index", 0))
+			drag.position = Vector2(data.get("position", [0.0, 0.0])[0], data.get("position", [0.0, 0.0])[1])
+			drag.relative = Vector2(data.get("relative", [0.0, 0.0])[0], data.get("relative", [0.0, 0.0])[1])
+			drag.velocity = Vector2(data.get("velocity", [0.0, 0.0])[0], data.get("velocity", [0.0, 0.0])[1])
+			drag.pressure = float(data.get("pressure", 0.0))
+			drag.tilt = Vector2(data.get("tilt", [0.0, 0.0])[0], data.get("tilt", [0.0, 0.0])[1])
+			event = drag
+		"action":
+			var action := InputEventAction.new()
+			action.action = StringName(String(data.get("action", "")))
+			action.pressed = bool(data.get("pressed", false))
+			action.strength = float(data.get("strength", 1.0))
+			event = action
+	if event != null:
+		event.device = int(data.get("device", -1))
+	return event
+
+
+func _replay_deliver_input_event(data: Dictionary) -> void:
+	var event := _deserialize_replay_input_event(data)
+	if event == null:
+		replay_diverged = true
+		replay_divergence_tick = replay_frame_index
+		return
+	if data.has("position"):
+		replay_mouse_position = Vector2(data["position"][0], data["position"][1])
+	replay_injecting_event = true
+	_input(event)
+	replay_gui_dispatching = true
+	Input.parse_input_event(event)
+	replay_gui_dispatching = false
+	replay_injecting_event = false
+
+
+func _replay_get_mouse_position() -> Vector2:
+	return replay_mouse_position if replay_mode != ReplayMode.OFF else get_viewport().get_mouse_position()
+
+
+func _replay_action_pressed(action: String) -> bool:
+	if replay_mode == ReplayMode.PLAYBACK:
+		return replay_tape.is_action_pressed(action)
+	return Input.is_action_pressed(action)
+
+
+func _replay_action_just_pressed(action: String) -> bool:
+	if replay_mode == ReplayMode.PLAYBACK:
+		return replay_tape.is_action_just_pressed(action)
+	return Input.is_action_just_pressed(action)
+
+
+func _replay_action_strength(action: String) -> float:
+	if replay_mode == ReplayMode.PLAYBACK:
+		return replay_tape.get_action_strength(action)
+	return Input.get_action_strength(action)
+
+
+func _replay_get_vector(left: String, right: String, up: String, down: String, deadzone: float = -1.0) -> Vector2:
+	if replay_mode != ReplayMode.PLAYBACK:
+		if deadzone < 0.0:
+			return Input.get_vector(left, right, up, down)
+		return Input.get_vector(left, right, up, down, deadzone)
+	var vector := Vector2(_replay_action_strength(right) - _replay_action_strength(left), _replay_action_strength(down) - _replay_action_strength(up))
+	var magnitude := vector.length()
+	var effective_deadzone := deadzone if deadzone >= 0.0 else 0.2
+	if magnitude <= effective_deadzone:
+		return Vector2.ZERO
+	return vector.normalized() * clampf((magnitude - effective_deadzone) / maxf(1.0 - effective_deadzone, 0.001), 0.0, 1.0)
+
+
+func _simulation_randf() -> float:
+	return simulation_rng.randf()
+
+
+func _simulation_randf_range(from: float, to: float) -> float:
+	return simulation_rng.randf_range(from, to)
+
+
+func _simulation_randi() -> int:
+	return simulation_rng.randi()
+
+
+func _simulation_randi_range(from: int, to: int) -> int:
+	return simulation_rng.randi_range(from, to)
+
+
+func _simulation_shuffle(values: Array) -> void:
+	for index in range(values.size() - 1, 0, -1):
+		var other := _simulation_randi_range(0, index)
+		var temporary: Variant = values[index]
+		values[index] = values[other]
+		values[other] = temporary
+
+
+func _simulation_pick_random(values: Array) -> Variant:
+	if values.is_empty():
+		return null
+	return values[_simulation_randi_range(0, values.size() - 1)]
+
+
+func _replay_json_safe(value: Variant) -> Variant:
+	if value is Vector2:
+		return [value.x, value.y]
+	if value is Vector2i:
+		return [value.x, value.y]
+	if value is Rect2:
+		return [value.position.x, value.position.y, value.size.x, value.size.y]
+	if value is Color:
+		return [value.r, value.g, value.b, value.a]
+	if value is StringName:
+		return String(value)
+	if value is Dictionary:
+		var result := {}
+		for key in value:
+			result[String(key)] = _replay_json_safe(value[key])
+		return result
+	if value is Array:
+		var result: Array = []
+		for item in value:
+			result.append(_replay_json_safe(item))
+		return result
+	if value is Object:
+		return "<" + value.get_class() + ">"
+	return value
+
+
+func get_replay_state_hash() -> String:
+	var snapshot := {
+		"phase": phase, "round": round_number, "countdown": countdown, "world_time": world_time,
+		"run_elapsed": run_elapsed_time, "player_hp": player_hp, "player_position": player_position,
+		"player_velocity": player_move_velocity, "player_stride": player_stride_clock,
+		"pointer": replay_mouse_position, "build_menu": build_menu_open, "dealer_menu": dealer_menu_open,
+		"inventory_menu": inventory_menu_open, "escape_confirm": escape_confirm_open, "tutorial": tutorial_visible,
+		"selected_cell": selected_cell, "build_tab": build_menu_tab, "selected_sentry": selected_sentry_kind,
+		"inside_house": inside_house, "inside_cave": inside_cave, "interior_position": interior_player_position,
+		"cave_position": cave_player_position, "wood": wood, "stone": stone, "iron": iron,
+		"gold": gold, "gunpowder": gunpowder, "crystals": cave_crystals_owned,
+		"structures": structures, "enemies": enemies, "corpses": enemy_corpses,
+		"projectiles": projectiles, "spawn_queue": spawn_queue, "enemy_spawn_index": enemy_spawn_index,
+		"resource_nodes": resource_nodes, "forest_trees": forest_tree_cells, "forest_animals": forest_animals,
+		"generated_chunks": generated_forest_chunk_count, "cave_nodes": cave_nodes,
+		"cave_enemies": cave_enemies, "cave_corpses": cave_enemy_corpses,
+		"cave_crystals": cave_crystals, "rock_markers": cave_boss_rock_markers,
+		"falling_rocks": cave_falling_rocks, "rock_rubble": cave_rock_rubble,
+		"cave_room": cave_room_id, "cave_cycle": cave_cycle_index, "cave_boss_defeated": cave_boss_defeated,
+		"defend_elapsed": defend_elapsed, "next_enemy_id": next_enemy_id,
+		"enemy_shots": enemy_shots, "harvest_timer": harvest_timer
+	}
+	var context := HashingContext.new()
+	context.start(HashingContext.HASH_SHA256)
+	context.update(JSON.stringify(_replay_json_safe(snapshot)).to_utf8_buffer())
+	return context.finish().hex_encode()
+
+
+func _get_replay_state_group_hashes() -> Dictionary:
+	var groups := {
+		"phase": [phase, round_number, countdown, world_time, run_elapsed_time, defend_elapsed, enemy_spawn_index, next_enemy_id],
+		"player": [player_hp, player_position, player_move_velocity, player_stride_clock, player_attack_cooldown, player_swing_timer, player_aim_direction],
+		"inventory": [wood, stone, iron, gold, gunpowder, cave_crystals_owned, turret_ammo, cannon_shells],
+		"yard": [structures, enemies, enemy_corpses, projectiles, spawn_queue, enemy_shots],
+		"forest": [resource_nodes, forest_tree_cells, forest_animals, generated_forest_chunk_count],
+		"cave": [inside_cave, cave_player_position, cave_room_id, cave_nodes, cave_enemies, cave_enemy_corpses, cave_crystals, cave_boss_rock_markers, cave_falling_rocks, cave_rock_rubble]
+	}
+	var result := {}
+	for group_name in groups:
+		var context := HashingContext.new()
+		context.start(HashingContext.HASH_SHA256)
+		context.update(JSON.stringify(_replay_json_safe(groups[group_name])).to_utf8_buffer())
+		result[group_name] = context.finish().hex_encode()
+	return result
 
 
 func _setup_team_intro() -> void:
@@ -1031,6 +1602,41 @@ func _update_team_intro(delta: float) -> void:
 
 
 func _input(event: InputEvent) -> void:
+	if replay_mode == ReplayMode.PLAYBACK and replay_gui_dispatching:
+		return
+	if replay_mode == ReplayMode.PLAYBACK and not replay_injecting_event:
+		if event is InputEventKey:
+			var replay_key := event as InputEventKey
+			if replay_key.pressed and not replay_key.echo:
+				match replay_key.keycode:
+					KEY_ESCAPE:
+						stop_replay_playback()
+						_return_to_main_menu()
+					KEY_SPACE:
+						set_replay_paused(not replay_playback_paused)
+					KEY_EQUAL, KEY_PLUS, KEY_KP_ADD:
+						set_replay_speed(replay_playback_speed + 0.25)
+					KEY_MINUS, KEY_KP_SUBTRACT:
+						set_replay_speed(replay_playback_speed - 0.25)
+					KEY_LEFT:
+						seek_replay(maxi(replay_frame_index - 120, 0))
+					KEY_RIGHT:
+						seek_replay(mini(replay_frame_index + 120, replay_tape.data["frames"].size()))
+					_:
+						pass
+				queue_redraw()
+				get_viewport().set_input_as_handled()
+				return
+		get_viewport().set_input_as_handled()
+		return
+	if replay_mode == ReplayMode.RECORD and not replay_injecting_event:
+		var serialized_event := _serialize_replay_input_event(event)
+		if serialized_event.is_empty():
+			replay_recording_error = "Unsupported input event: %s" % event.get_class()
+		else:
+			replay_pending_events.append(serialized_event)
+			if event is InputEventMouseButton or event is InputEventMouseMotion:
+				replay_mouse_position = event.position
 	if auto_control_prompts_enabled:
 		var detected_device := last_input_device
 		if event is InputEventJoypadButton and (event as InputEventJoypadButton).pressed:
@@ -1068,6 +1674,26 @@ func _input(event: InputEvent) -> void:
 		if skip_intro:
 			_begin_team_intro_exit()
 			get_viewport().set_input_as_handled()
+		return
+	if revive_offer_pending or revive_offer_visible or ad_in_progress:
+		if revive_offer_visible:
+			if event is InputEventKey:
+				var revive_key := event as InputEventKey
+				if revive_key.pressed and not revive_key.echo:
+					if revive_key.keycode in [KEY_ENTER, KEY_KP_ENTER, KEY_Y]:
+						_accept_revive_offer()
+						get_viewport().set_input_as_handled()
+					elif revive_key.keycode in [KEY_ESCAPE, KEY_N]:
+						_decline_revive_offer("The offer was declined.")
+						get_viewport().set_input_as_handled()
+			elif event is InputEventJoypadButton:
+				var revive_joy := event as InputEventJoypadButton
+				if revive_joy.pressed and revive_joy.button_index == JOY_BUTTON_A:
+					_accept_revive_offer()
+					get_viewport().set_input_as_handled()
+				elif revive_joy.pressed and revive_joy.button_index == JOY_BUTTON_B:
+					_decline_revive_offer("The offer was declined.")
+					get_viewport().set_input_as_handled()
 		return
 	if escape_confirm_open:
 		if event is InputEventKey:
@@ -1323,6 +1949,12 @@ func _should_play_boss_music() -> bool:
 
 
 func _update_cave_music() -> void:
+	if _revive_flow_holds_music():
+		if cave_music_player != null and cave_music_player.playing:
+			cave_music_player.stream_paused = true
+		if boss_music_player != null and boss_music_player.playing:
+			boss_music_player.stream_paused = true
+		return
 	var should_play_cave_music: bool = inside_cave and (phase == Phase.BUILD or phase == Phase.DEFEND)
 	var should_play_boss: bool = _should_play_boss_music()
 	if should_play_boss:
@@ -1367,6 +1999,11 @@ func _should_play_gameplay_music() -> bool:
 
 func _update_gameplay_music() -> void:
 	if gameplay_music_player == null:
+		return
+	if _revive_flow_holds_music():
+		if gameplay_music_player.playing:
+			gameplay_music_player.stream_paused = true
+		_update_music_credit_panel()
 		return
 	if phase == Phase.MENU or phase == Phase.GAME_OVER:
 		if gameplay_music_player.playing:
@@ -1528,6 +2165,56 @@ func _enter_house() -> void:
 
 
 func _process(delta: float) -> void:
+	_update_ui_motion(delta)
+	if replay_mode == ReplayMode.PLAYBACK:
+		if replay_playback_paused:
+			return
+		replay_playback_accumulator += delta * replay_playback_speed
+		var processed_steps := 0
+		var max_playback_steps := 1 if replay_seek_in_progress else 16
+		while replay_tape.has_next_frame() and processed_steps < max_playback_steps:
+			var preview: Dictionary = replay_tape.peek_frame()
+			var recorded_delta := float(preview.get("delta", 0.0))
+			if not replay_seek_in_progress and replay_playback_accumulator + 0.0000001 < recorded_delta:
+				break
+			var playback_frame: Dictionary = replay_tape.next_frame()
+			if not replay_seek_in_progress:
+				replay_playback_accumulator = maxf(replay_playback_accumulator - recorded_delta, 0.0)
+			replay_frame_index = int(playback_frame["tick"])
+			for event_data in playback_frame.get("events", []):
+				_replay_deliver_input_event(event_data)
+				if replay_diverged:
+					replay_mode = ReplayMode.OFF
+					return
+			var expected_checkpoint: Dictionary = playback_frame.get("checkpoint", {})
+			if not String(expected_checkpoint.get("state_hash", "")).is_empty() and String(expected_checkpoint.get("state_hash", "")) != get_replay_state_hash():
+				replay_diverged = true
+				replay_divergence_tick = replay_frame_index
+				printerr("REPLAY_DIVERGED tick=", replay_frame_index, " expected_groups=", expected_checkpoint.get("groups", {}), " actual_groups=", _get_replay_state_group_hashes(), " expected_player=", expected_checkpoint.get("player", []), " actual_player=", _replay_json_safe([player_hp, player_position, player_move_velocity, player_stride_clock, player_attack_cooldown, player_swing_timer, player_aim_direction]), " expected_input=", playback_frame.get("held", []), " strengths=", playback_frame.get("strengths", {}))
+				replay_mode = ReplayMode.OFF
+				return
+			_process_game_step(recorded_delta)
+			processed_steps += 1
+		return
+	elif replay_mode == ReplayMode.RECORD:
+		var replay_inputs := _capture_replay_inputs()
+		var checkpoint := {}
+		if replay_frame_index % REPLAY_HASH_INTERVAL == 0:
+			checkpoint = {"state_hash": get_replay_state_hash()}
+		var pending_events := replay_pending_events.duplicate(true)
+		replay_pending_events.clear()
+		if not replay_recording_error.is_empty():
+			replay_mode = ReplayMode.OFF
+			return
+		if not replay_tape.record_frame(replay_frame_index, replay_inputs["held"], checkpoint, replay_inputs["strengths"], delta, pending_events):
+			replay_recording_error = "Recording stopped: replay size or frame limits reached."
+			replay_mode = ReplayMode.OFF
+			return
+		replay_frame_index += 1
+	_process_game_step(delta)
+
+
+func _process_game_step(delta: float) -> void:
 	if team_intro_active:
 		_update_team_intro(delta)
 		return
@@ -1557,6 +2244,11 @@ func _process(delta: float) -> void:
 
 	if phase == Phase.GAME_OVER:
 		_sync_visual_nodes()
+		_update_revive_offer(delta)
+		if revive_offer_pending or revive_offer_visible or ad_in_progress:
+			_refresh_hud()
+			queue_redraw()
+			return
 		if dev_mode_prompt_open or menu_settings_open or menu_credits_open:
 			_refresh_hud()
 			queue_redraw()
@@ -1667,7 +2359,7 @@ func _sync_player_visual() -> void:
 	player_visual_node.visible = visible_world
 	if not visible_world:
 		return
-	var raw_move_input: Vector2 = Input.get_vector("move_left", "move_right", "move_up", "move_down")
+	var raw_move_input: Vector2 = _replay_get_vector("move_left", "move_right", "move_up", "move_down")
 	var move_input: Vector2 = player_move_velocity.normalized() if player_move_velocity.length_squared() > 1.0 else raw_move_input
 	var base_position: Vector2 = player_position - camera_position
 	if inside_cave:
@@ -2000,8 +2692,8 @@ func _configure_sprite_region(sprite: Sprite2D, texture: Texture2D, region: Rect
 
 func _menu_start_pressed() -> bool:
 	return (
-		Input.is_action_just_pressed("restart")
-		or Input.is_action_just_pressed("start_wave_early")
+		_replay_action_just_pressed("restart")
+		or _replay_action_just_pressed("start_wave_early")
 	)
 
 
@@ -2070,6 +2762,8 @@ func _on_menu_dev_pressed() -> void:
 	menu_credits_open = false
 	if dev_mode_enabled:
 		dev_mode_enabled = false
+		if leaderboard_host != null:
+			leaderboard_host.set_dev_mode_active(false)
 		dev_mode_prompt_open = false
 		_close_dev_mode_prompt()
 		_refresh_settings_buttons()
@@ -2084,6 +2778,8 @@ func _on_menu_dev_pressed() -> void:
 func _on_menu_dev_unlock_pressed() -> void:
 	if menu_dev_pin_input.text == DEV_MODE_PIN:
 		dev_mode_enabled = true
+		if leaderboard_host != null:
+			leaderboard_host.set_dev_mode_active(true)
 		dev_mode_prompt_open = false
 		menu_dev_status_label.text = "Dev mode unlocked"
 		_refresh_settings_buttons()
@@ -2127,7 +2823,10 @@ func _apply_dev_mode_start_state() -> void:
 
 
 func _draw() -> void:
-	draw_rect(Rect2(Vector2.ZERO, SCREEN_SIZE), BG_COLOR, true)
+	# The screen fill, ground tiles, waving grass and build grid moved to
+	# $GroundLayer, which renders beneath this canvas item. That opens the
+	# z-index band $WorldSpriteLayer uses for real sprite nodes, so world art can
+	# become a Sprite2D without covering the effects and HUD drawn below.
 	if phase == Phase.MENU and menu_background_texture != null:
 		_draw_menu_background(true)
 	elif phase == Phase.GAME_OVER:
@@ -2135,15 +2834,10 @@ func _draw() -> void:
 	if phase == Phase.MENU or phase == Phase.GAME_OVER:
 		_draw_menu_handmade_frame()
 		_draw_scene_transition()
+		_draw_replay_controls()
 		return
-	_draw_ground_area(Rect2(GRID_ORIGIN, Vector2(GRID_SIZE.x, FOREST_START_ROW) * CELL_SIZE), GRASS_COLOR)
-	var forest_top := _cell_to_world(Vector2i(0, FOREST_START_ROW))
-	var forest_bottom_y: float = max(forest_top.y + SCREEN_SIZE.y + CELL_SIZE * 2.0, camera_position.y + SCREEN_SIZE.y + CELL_SIZE * 2.0)
-	_draw_ground_area(Rect2(forest_top, Vector2(GRID_SIZE.x * CELL_SIZE, forest_bottom_y - forest_top.y)), WOODS_COLOR)
-	_draw_waving_grass()
 	_draw_house()
 	_draw_dealer_stand()
-	_draw_grid()
 	_draw_resources()
 	_draw_forest_animals()
 	_draw_trees()
@@ -2170,10 +2864,21 @@ func _draw() -> void:
 	_draw_hit_effects()
 	_draw_countdown_display()
 	_draw_tutorial_panel()
-	_draw_dealer_menu()
-	_draw_build_menu()
-	_draw_inventory_menu()
+	_draw_ui_stamps(false)
+	_draw_paper_panels()
 	_draw_scene_transition()
+	_draw_iris_open()
+	_draw_replay_controls()
+
+
+func _draw_replay_controls() -> void:
+	if replay_mode != ReplayMode.PLAYBACK:
+		return
+	var status := "REPLAY  %s  %.2fx     Space: pause  ←/→: seek  +/-: speed  Esc: exit" % ["PAUSED" if replay_playback_paused else "PLAYING", replay_playback_speed]
+	var bar := Rect2(Vector2(12, 12), Vector2(710, 30))
+	draw_rect(bar, Color(0.03, 0.05, 0.08, 0.88), true)
+	draw_rect(bar, Color(0.96, 0.82, 0.44, 0.55), false, 1.0)
+	draw_string(ThemeDB.fallback_font, bar.position + Vector2(10, 21), status, HORIZONTAL_ALIGNMENT_LEFT, -1.0, 14, UI_WARM_ACCENT)
 
 
 func _draw_menu_background(react_to_music: bool) -> void:
@@ -2198,7 +2903,7 @@ func _draw_menu_background(react_to_music: bool) -> void:
 		var scaled_size: Vector2 = SCREEN_SIZE * zoom_scale
 		var parallax_offset := Vector2.ZERO
 		if menu_motion_enabled:
-			var mouse_ratio: Vector2 = get_viewport().get_mouse_position() / SCREEN_SIZE - Vector2(0.5, 0.5)
+			var mouse_ratio: Vector2 = _replay_get_mouse_position() / SCREEN_SIZE - Vector2(0.5, 0.5)
 			if _using_controller_prompts():
 				mouse_ratio = Vector2(sin(world_time * 0.37), cos(world_time * 0.29)) * 0.32
 			parallax_offset = -mouse_ratio * MENU_BACKGROUND_PARALLAX
@@ -2229,15 +2934,99 @@ func _draw_menu_handmade_frame() -> void:
 
 
 func _draw_game_over_background() -> void:
+	draw_rect(Rect2(Vector2.ZERO, SCREEN_SIZE), Color(0.045, 0.04, 0.05), true)
 	if loss_screen_texture != null:
-		draw_texture_rect(loss_screen_texture, Rect2(Vector2.ZERO, SCREEN_SIZE), false)
-		draw_rect(Rect2(Vector2.ZERO, SCREEN_SIZE), Color(0.02, 0.03, 0.04, 0.34), true)
-		return
-	if menu_background_texture != null:
+		# Player pick: the team's death art stays large and undimmed above the receipt.
+		if loss_screen_used_rect.size == Vector2.ZERO:
+			var loss_image := loss_screen_texture.get_image()
+			loss_screen_used_rect = Rect2(loss_image.get_used_rect()) if loss_image != null else Rect2(Vector2.ZERO, loss_screen_texture.get_size())
+		var art_size := loss_screen_used_rect.size
+		var art_width: float = 860.0
+		var art_height: float = art_width * art_size.y / maxf(art_size.x, 1.0)
+		var art_rect := Rect2(Vector2((SCREEN_SIZE.x - art_width) * 0.5, 104.0), Vector2(art_width, art_height))
+		draw_texture_rect_region(loss_screen_texture, art_rect, loss_screen_used_rect)
+	elif menu_background_texture != null:
 		_draw_menu_background(false)
+	_draw_game_over_receipt()
+
+
+func _game_over_receipt_lines() -> Array:
+	var run_minutes := int(floor(run_elapsed_time / 60.0))
+	var run_seconds := int(floor(run_elapsed_time)) % 60
+	return [
+		["Taxpayer", "Bob"],
+		["Rounds survived", str(maxi(round_number - 1, 0))],
+		["Agents defeated", str(run_enemies_defeated)],
+		["Best round ever", str(highest_round)],
+		["Resources gathered", str(run_resources_gathered)],
+		["Defenses built", str(run_structures_built)],
+		["Repairs", str(run_repairs_completed)],
+		["Cave rooms", str(cave_seen_rooms.size())],
+		["Boss", "defeated" if cave_boss_defeated else "collecting interest"],
+		["Run time", "%d:%02d" % [run_minutes, run_seconds]],
+		["Air fryer", "SEIZED"],
+	]
+
+
+func _draw_game_over_receipt() -> void:
+	var font := ThemeDB.fallback_font
+	var receipt := Rect2(Vector2(672, 292), Vector2(410, 330))
+	draw_set_transform(receipt.get_center(), 0.022, Vector2.ONE)
+	var local := Rect2(-receipt.size * 0.5, receipt.size)
+	draw_rect(Rect2(local.position + Vector2(5, 7), local.size), Color(0, 0, 0, 0.5), true)
+	draw_rect(local, UI_PAPER_FILL, true)
+	var line_y := local.position.y + 54.0
+	while line_y < local.end.y - 8.0:
+		draw_line(Vector2(local.position.x + 10, line_y), Vector2(local.end.x - 10, line_y), Color(0.72, 0.64, 0.48, 0.45), 1.0)
+		line_y += 22.0
+	draw_string(font, local.position + Vector2(18, 32), "IRS NOTICE OF SEIZURE", HORIZONTAL_ALIGNMENT_LEFT, -1, 20, UI_PAPER_INK)
+	var row_y := local.position.y + 70.0
+	for row in _game_over_receipt_lines():
+		draw_string(font, Vector2(local.position.x + 18, row_y), String(row[0]), HORIZONTAL_ALIGNMENT_LEFT, -1, 14, UI_PAPER_INK)
+		draw_string(font, Vector2(local.position.x + 18, row_y), String(row[1]), HORIZONTAL_ALIGNMENT_RIGHT, local.size.x - 36.0, 14, UI_STAMP_RED if String(row[1]) == "SEIZED" else UI_PAPER_INK)
+		row_y += 20.0
+	var taunt := game_over_taunt if game_over_taunt != "" else String(IRS_DEFEAT_TAUNTS[0])
+	draw_multiline_string(font, Vector2(local.position.x + 18, row_y + 6.0), taunt, HORIZONTAL_ALIGNMENT_LEFT, local.size.x - 36.0, 13, 2, Color(UI_PAPER_INK, 0.78))
+	draw_set_transform(receipt.get_center() + Vector2(150, -148), 0.22, Vector2.ONE * 0.78)
+	var stamp := Rect2(Vector2(-92, -22), Vector2(184, 44))
+	draw_rect(stamp, Color(UI_STAMP_RED, 0.12), true)
+	draw_rect(stamp, Color(UI_STAMP_RED, 0.9), false, 3.0)
+	draw_string(font, Vector2(-92, 8), "ASSET SEIZED", HORIZONTAL_ALIGNMENT_CENTER, 184, 22, Color(UI_STAMP_RED, 0.95))
+	draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+
+
+func _layout_game_over_home(show_dev: bool) -> void:
+	var y := 236.0
+	menu_start_button.position = Vector2(92, y)
+	y += 70.0
+	menu_settings_button.position = Vector2(92, y)
+	y += 74.0
+	if show_dev:
+		menu_dev_button.position = Vector2(111, y)
+		menu_dev_button.size = Vector2(262, 55)
+		menu_dev_button.pivot_offset = menu_dev_button.size * 0.5
+		y += 72.0
+	menu_tutorial_button.position = Vector2(112, y + 6.0)
+	menu_tutorial_button.size = Vector2(260, 44)
 
 
 func _start_new_game() -> void:
+	if replay_mode == ReplayMode.OFF:
+		replay_run_seed = int(Time.get_ticks_usec() % 9007199254740991)
+		replay_tape = load("res://scripts/replay/replay_tape.gd").new()
+		replay_tape.begin(REPLAY_GAME_VERSION, replay_run_seed, 60, _capture_replay_metadata())
+		replay_mode = ReplayMode.RECORD
+		replay_frame_index = 0
+		replay_recording_error = ""
+		replay_pending_events.clear()
+		replay_last_run_id = _new_replay_run_id()
+		replay_used_dev_mode = dev_mode_enabled
+		replay_mouse_position = get_viewport().get_mouse_position() if is_inside_tree() else Vector2.ZERO
+	if replay_mode == ReplayMode.PLAYBACK:
+		replay_run_seed = int(replay_tape.data["seed"])
+	elif replay_mode != ReplayMode.RECORD:
+		replay_run_seed = int(Time.get_ticks_usec() % 9007199254740991)
+	simulation_rng.seed = replay_run_seed
 	menu_settings_open = false
 	menu_credits_open = false
 	round_number = 1
@@ -2296,9 +3085,18 @@ func _start_new_game() -> void:
 	wave_banner_timer = 0.0
 	wave_banner_text = ""
 	game_over_taunt = ""
+	revive_used = false
+	revive_offer_pending = false
+	revive_offer_visible = false
+	revive_offer_delay = 0.0
+	revive_offer_countdown = 0.0
+	ad_in_progress = false
+	if revive_offer_panel != null:
+		revive_offer_panel.visible = false
 	wave_banner_duration = WAVE_BANNER_TIME
 	phase_transition_timer = PHASE_TRANSITION_TIME
 	phase_transition_color = UI_WARM_ACCENT
+	_start_iris_open()
 	player_step_effect_timer = 0.0
 	run_start_input_lock_timer = 0.25
 	build_menu_open = false
@@ -2380,22 +3178,22 @@ func _start_new_game() -> void:
 
 func _update_house_toggle() -> void:
 	if _cave_active():
-		if Input.is_action_just_pressed("dealer_menu"):
+		if _replay_action_just_pressed("dealer_menu"):
 			dealer_menu_open = false
-		if Input.is_action_just_pressed("enter_cave") and _is_player_near_cave_exit():
+		if _replay_action_just_pressed("enter_cave") and _is_player_near_cave_exit():
 			_leave_cave()
-		elif Input.is_action_just_pressed("enter_cave") and _is_boss_encounter_locked():
+		elif _replay_action_just_pressed("enter_cave") and _is_boss_encounter_locked():
 			_show_wave_banner_for("Arena Sealed\nBeat The Broodmother", 1.1)
 		return
 	if inside_house:
-		if Input.is_action_just_pressed("enter_cave") and _is_player_near_house_exit():
+		if _replay_action_just_pressed("enter_cave") and _is_player_near_house_exit():
 			_leave_house()
 		return
 	if run_start_input_lock_timer > 0.0:
 		return
 	if build_menu_open:
 		return
-	if phase == Phase.BUILD and Input.is_action_just_pressed("dealer_menu") and _is_player_near_dealer_stand():
+	if phase == Phase.BUILD and _replay_action_just_pressed("dealer_menu") and _is_player_near_dealer_stand():
 		dealer_menu_open = not dealer_menu_open
 		if dealer_menu_open:
 			build_menu_open = false
@@ -2403,7 +3201,7 @@ func _update_house_toggle() -> void:
 			dealer_selected_index = 0
 			tutorial_opened_dealer = true
 		return
-	if not Input.is_action_just_pressed("enter_cave"):
+	if not _replay_action_just_pressed("enter_cave"):
 		return
 	if _is_player_near_house_door() and (phase == Phase.BUILD or phase == Phase.DEFEND):
 		_enter_house()
@@ -2770,17 +3568,17 @@ func _generate_forest_chunk(chunk_index: int) -> void:
 				continue
 			var center_bias: float = 1.0 - absf((float(x) / max(1.0, float(GRID_SIZE.x - 1))) - 0.5) * 0.95
 			var depth_bias: float = clampf(float(y - FOREST_START_ROW) / 24.0, 0.0, 1.0)
-			var spawn_noise: float = randf()
+			var spawn_noise: float = _simulation_randf()
 			var spawn_score: float = spawn_noise + center_bias * 0.24 + depth_bias * 0.12
 			if spawn_score < FOREST_TREE_DENSITY:
 				var stone_chance: float = FOREST_STONE_DENSITY + depth_bias * DEEP_STONE_DENSITY_BONUS
-				if randf() < stone_chance and _find_resource_node_at_cell(cell) == -1:
+				if _simulation_randf() < stone_chance and _find_resource_node_at_cell(cell) == -1:
 					resource_nodes.append(_make_resource_node(cell, "stone"))
 				else:
 					animal_candidates.append(cell)
 				continue
 			forest_tree_cells.append(cell)
-			if randf() < FOREST_RESOURCE_DENSITY + depth_bias * DEEP_RESOURCE_DENSITY_BONUS:
+			if _simulation_randf() < FOREST_RESOURCE_DENSITY + depth_bias * DEEP_RESOURCE_DENSITY_BONUS:
 				_add_wood_tree_node(cell)
 	_spawn_forest_animals_for_chunk(chunk_index, animal_candidates)
 
@@ -2789,28 +3587,28 @@ func _spawn_forest_animals_for_chunk(chunk_index: int, candidate_cells: Array[Ve
 	if candidate_cells.is_empty():
 		return
 	var shuffled_cells: Array[Vector2i] = candidate_cells.duplicate()
-	shuffled_cells.shuffle()
+	_simulation_shuffle(shuffled_cells)
 	var spawn_count: int = mini(FOREST_ANIMALS_PER_CHUNK, shuffled_cells.size())
 	for spawn_index in range(spawn_count):
 		var animal_cell: Vector2i = shuffled_cells[spawn_index]
 		if animal_cell.distance_to(PLAYER_START_CELL) <= 4:
 			continue
-		var animal_kind: String = "dog" if randf() < 0.55 else "beaver"
+		var animal_kind: String = "dog" if _simulation_randf() < 0.55 else "beaver"
 		forest_animals.append(_make_forest_animal(animal_cell, animal_kind, chunk_index))
 
 
 func _make_forest_animal(cell: Vector2i, animal_kind: String, chunk_index: int) -> Dictionary:
-	var anchor_position: Vector2 = _cell_to_world(cell) + Vector2(CELL_SIZE * 0.5 + randf_range(-8.0, 8.0), CELL_SIZE * 0.5 + randf_range(-2.0, 6.0))
+	var anchor_position: Vector2 = _cell_to_world(cell) + Vector2(CELL_SIZE * 0.5 + _simulation_randf_range(-8.0, 8.0), CELL_SIZE * 0.5 + _simulation_randf_range(-2.0, 6.0))
 	return {
 		"kind": animal_kind,
 		"chunk": chunk_index,
 		"anchor": anchor_position,
 		"position": anchor_position,
-		"direction": -1.0 if randf() < 0.5 else 1.0,
-		"speed": randf_range(FOREST_ANIMAL_WANDER_SPEED_MIN, FOREST_ANIMAL_WANDER_SPEED_MAX),
-		"range": randf_range(24.0, 54.0),
-		"facing_left": randf() < 0.5,
-		"bob_phase": randf() * TAU
+		"direction": -1.0 if _simulation_randf() < 0.5 else 1.0,
+		"speed": _simulation_randf_range(FOREST_ANIMAL_WANDER_SPEED_MIN, FOREST_ANIMAL_WANDER_SPEED_MAX),
+		"range": _simulation_randf_range(24.0, 54.0),
+		"facing_left": _simulation_randf() < 0.5,
+		"bob_phase": _simulation_randf() * TAU
 	}
 
 
@@ -2859,6 +3657,8 @@ func _start_build_phase() -> void:
 
 
 func _start_defend_phase() -> void:
+	if replay_mode == ReplayMode.RECORD:
+		replay_tape.record_marker(replay_frame_index, "wave", {"round": round_number})
 	phase = Phase.DEFEND
 	phase_transition_timer = PHASE_TRANSITION_TIME
 	phase_transition_color = UI_DANGER_ACCENT
@@ -2931,7 +3731,7 @@ func _build_spawn_queue() -> void:
 		if round_number >= 3:
 			var weak_lane: String = _weakest_defense_lane()
 			var adaptive_chance: float = clampf(0.18 + float(round_number - 3) * 0.045, 0.18, 0.62)
-			if randf() < adaptive_chance:
+			if _simulation_randf() < adaptive_chance:
 				lane = weak_lane
 		var enemy_type: String = "runner"
 		if brute_every > 0 and index > 0 and (index + 1) % brute_every == 0:
@@ -2969,21 +3769,21 @@ func _build_spawn_queue() -> void:
 func _update_build_phase(delta: float) -> void:
 	countdown = max(countdown - delta, 0.0)
 
-	if Input.is_action_just_pressed("build_arrow_turret"):
+	if _replay_action_just_pressed("build_arrow_turret"):
 		_toggle_build_menu()
 	elif build_menu_open:
 		_update_build_menu_input()
-	elif Input.is_action_just_pressed("upgrade_turret"):
+	elif _replay_action_just_pressed("upgrade_turret"):
 		_try_upgrade_turret()
-	elif Input.is_action_just_pressed("repair_wall"):
+	elif _replay_action_just_pressed("repair_wall"):
 		if not _try_repair_wall():
 			_try_repair_house()
-	elif Input.is_action_just_pressed("sell_structure"):
+	elif _replay_action_just_pressed("sell_structure"):
 		_try_sell_structure()
-	elif Input.is_action_just_pressed("start_wave_early"):
+	elif _replay_action_just_pressed("start_wave_early"):
 		_start_defend_phase()
 		return
-	elif Input.is_action_just_pressed("skip_build_test"):
+	elif _replay_action_just_pressed("skip_build_test"):
 		_start_defend_phase()
 		return
 
@@ -3000,14 +3800,14 @@ func _toggle_build_menu() -> void:
 
 
 func _update_build_menu_input() -> void:
-	var hovered_weapon: String = _build_menu_weapon_at_position(get_viewport().get_mouse_position())
+	var hovered_weapon: String = _build_menu_weapon_at_position(_replay_get_mouse_position())
 	if hovered_weapon != "":
 		selected_sentry_kind = hovered_weapon
-	if Input.is_action_just_pressed("move_left") or Input.is_action_just_pressed("move_up"):
+	if _replay_action_just_pressed("move_left") or _replay_action_just_pressed("move_up"):
 		_cycle_sentry_selection(-1)
-	elif Input.is_action_just_pressed("move_right") or Input.is_action_just_pressed("move_down"):
+	elif _replay_action_just_pressed("move_right") or _replay_action_just_pressed("move_down"):
 		_cycle_sentry_selection(1)
-	elif Input.is_action_just_pressed("action") or Input.is_action_just_pressed("start_wave_early") or Input.is_action_just_pressed("build_arrow_turret"):
+	elif _replay_action_just_pressed("action") or _replay_action_just_pressed("start_wave_early") or _replay_action_just_pressed("build_arrow_turret"):
 		_try_place_selected_sentry()
 
 
@@ -3078,17 +3878,7 @@ func _update_defend_phase(delta: float) -> void:
 	_update_projectiles(delta)
 
 	if trophy_stolen:
-		phase = Phase.GAME_OVER
-		if game_over_taunt == "":
-			game_over_taunt = String(IRS_DEFEAT_TAUNTS.pick_random())
-		phase_transition_timer = PHASE_TRANSITION_TIME
-		phase_transition_color = UI_DANGER_ACCENT
-		camera_shake_strength = CAMERA_SHAKE_MAX * screen_shake_percent / 100.0
-		_play_sfx(warning_sound, -11.0, 0.62)
-		highest_round = max(highest_round, round_number)
-		_save_persistent_settings()
-		if menu_start_button != null:
-			menu_start_button.call_deferred("grab_focus")
+		_enter_game_over_from_trophy_loss()
 		return
 
 	if enemy_spawn_index >= spawn_queue.size() and enemies.is_empty() and projectiles.is_empty():
@@ -3102,6 +3892,190 @@ func _update_defend_phase(delta: float) -> void:
 		_spawn_motion_burst(celebration_position, UI_SUCCESS_ACCENT, 18, 42.0, 128.0, inside_house or inside_cave, "spark")
 		_play_sfx(build_sound, -10.0, 1.16)
 		_play_sfx(pickup_sound, -14.0, 1.32)
+
+
+func _enter_game_over_from_trophy_loss() -> void:
+	phase = Phase.GAME_OVER
+	if game_over_taunt == "":
+		game_over_taunt = String(_simulation_pick_random(IRS_DEFEAT_TAUNTS))
+	phase_transition_timer = PHASE_TRANSITION_TIME
+	phase_transition_color = UI_DANGER_ACCENT
+	camera_shake_strength = CAMERA_SHAKE_MAX * screen_shake_percent / 100.0
+	_play_sfx(warning_sound, -11.0, 0.62)
+	highest_round = max(highest_round, round_number)
+	_save_persistent_settings()
+	if not revive_used:
+		_begin_revive_offer_flow()
+	else:
+		_finalize_run_after_game_over()
+		if menu_start_button != null:
+			menu_start_button.call_deferred("grab_focus")
+
+
+func _begin_revive_offer_flow() -> void:
+	revive_offer_pending = true
+	revive_offer_visible = false
+	revive_offer_delay = REVIVE_OFFER_DELAY
+	revive_offer_countdown = REVIVE_OFFER_DURATION
+	_pause_music_for_revive()
+	if menu_start_button != null:
+		menu_start_button.release_focus()
+
+
+func _update_revive_offer(delta: float) -> void:
+	if revive_offer_pending:
+		revive_offer_delay = maxf(revive_offer_delay - delta, 0.0)
+		if revive_offer_delay <= 0.0:
+			revive_offer_pending = false
+			revive_offer_visible = true
+			revive_offer_countdown = REVIVE_OFFER_DURATION
+			if revive_offer_watch_button != null:
+				revive_offer_watch_button.call_deferred("grab_focus")
+			return
+	if not revive_offer_visible:
+		return
+	revive_offer_countdown = maxf(revive_offer_countdown - delta, 0.0)
+	if revive_offer_countdown_label != null:
+		revive_offer_countdown_label.text = "Offer expires in %02d" % int(ceili(revive_offer_countdown))
+	if revive_offer_countdown <= 0.0:
+		_decline_revive_offer("The revive offer expired.")
+
+
+func _accept_revive_offer() -> void:
+	if not revive_offer_visible or ad_in_progress:
+		return
+	revive_offer_visible = false
+	revive_offer_pending = false
+	revive_used = true
+	ad_in_progress = true
+	if revive_offer_panel != null:
+		revive_offer_panel.visible = false
+	var service := get_node_or_null("/root/AdService")
+	if service == null:
+		_on_ad_failed("The rewarded-ad service is unavailable.")
+		return
+	service.call("set_volume_percent", music_volume_percent)
+	var requested: bool = bool(service.call("request_rewarded_ad", "evil", dev_tools_available and dev_mode_enabled))
+	if not requested and ad_in_progress:
+		_on_ad_failed("The rewarded ad could not start.")
+
+
+func _decline_revive_offer(_reason: String = "") -> void:
+	revive_used = true
+	revive_offer_pending = false
+	revive_offer_visible = false
+	revive_offer_delay = 0.0
+	revive_offer_countdown = 0.0
+	ad_in_progress = false
+	if revive_offer_panel != null:
+		revive_offer_panel.visible = false
+	_finish_revive_music(false)
+	if menu_start_button != null:
+		menu_start_button.disabled = false
+		menu_start_button.call_deferred("grab_focus")
+	_finalize_run_after_game_over()
+	_refresh_hud()
+	queue_redraw()
+
+
+func _connect_ad_service() -> void:
+	var service := get_node_or_null("/root/AdService")
+	if service == null:
+		return
+	var reward_callback := Callable(self, "_on_ad_rewarded")
+	var decline_callback := Callable(self, "_on_ad_declined")
+	var fail_callback := Callable(self, "_on_ad_failed")
+	if not service.is_connected("rewarded", reward_callback):
+		service.connect("rewarded", reward_callback)
+	if not service.is_connected("declined", decline_callback):
+		service.connect("declined", decline_callback)
+	if not service.is_connected("failed", fail_callback):
+		service.connect("failed", fail_callback)
+	service.call("set_volume_percent", music_volume_percent)
+
+
+func _on_ad_rewarded(_creative: String) -> void:
+	if not ad_in_progress:
+		return
+	ad_in_progress = false
+	_apply_rewarded_revive()
+
+
+func _on_ad_declined(reason: String) -> void:
+	if not ad_in_progress:
+		return
+	_decline_revive_offer(reason)
+
+
+func _on_ad_failed(message: String) -> void:
+	if not ad_in_progress:
+		return
+	push_warning("Rewarded ad failed: %s" % message)
+	_decline_revive_offer(message)
+
+
+func _apply_rewarded_revive() -> void:
+	trophy_stolen = false
+	stolen_house_items.erase(PRIZED_HOUSE_ITEM)
+	if not PRIZED_HOUSE_ITEM in house_items:
+		house_items.append(PRIZED_HOUSE_ITEM)
+	player_hp = PLAYER_MAX_HP + _extra_player_max_hp()
+	house_damage_stage = 0
+	for structure_key in structures.keys():
+		var structure: Dictionary = structures[structure_key]
+		var structure_type := int(structure.get("type", StructureType.NONE))
+		if _is_wall_structure(structure):
+			structure["hp"] = _wall_max_hp(structure_type)
+		elif structure_type == StructureType.TURRET:
+			structure["hp"] = int(structure.get("max_hp", 12))
+			structure["ammo"] = int(structure.get("max_ammo", _turret_starting_ammo_for_weapon(String(structure.get("weapon", "arrow")))))
+		enemies.clear()
+	projectiles.clear()
+	enemy_shots.clear()
+	spawn_queue.clear()
+	enemy_spawn_index = 0
+	inside_house = false
+	inside_cave = false
+	cave_mode_token = false
+	player_position = _cell_to_world(PLAYER_START_CELL) + Vector2(11, 11)
+	_reset_player_motion()
+	var revived_round := round_number
+	round_number += 1
+	highest_round = max(highest_round, round_number)
+	_save_persistent_settings()
+	_finish_revive_music(true)
+	_start_build_phase()
+	_show_wave_banner_for("LETERNAME REVIVAL APPROVED\nRound %d cleared — assets restored" % revived_round, 3.2)
+	_spawn_motion_burst(_active_player_position() + PLAYER_SIZE * 0.5, UI_SUCCESS_ACCENT, 24, 52.0, 156.0, false, "spark")
+	_play_sfx(build_sound, -8.0, 1.12)
+	_refresh_hud()
+	queue_redraw()
+
+
+func _revive_flow_holds_music() -> bool:
+	return revive_offer_pending or revive_offer_visible or ad_in_progress
+
+
+func _pause_music_for_revive() -> void:
+	for player in [gameplay_music_player, cave_music_player, boss_music_player]:
+		if player != null and player.playing:
+			player.stream_paused = true
+
+
+func _finish_revive_music(resume_gameplay: bool) -> void:
+	if cave_music_player != null:
+		cave_music_player.stop()
+		cave_music_player.stream_paused = false
+	if boss_music_player != null:
+		boss_music_player.stop()
+		boss_music_player.stream_paused = false
+	if gameplay_music_player == null:
+		return
+	if resume_gameplay and gameplay_music_player.playing:
+		gameplay_music_player.stream_paused = false
+	else:
+		gameplay_music_player.stop()
+		gameplay_music_player.stream_paused = false
 
 
 func _wave_clear_message(cleared_round: int) -> String:
@@ -3176,11 +4150,11 @@ func _update_player_combat_state(delta: float) -> void:
 	if inside_cave:
 		_update_cave_enemies(delta)
 		_update_cave_crystals()
-		if Input.is_action_just_pressed("action"):
+		if _replay_action_just_pressed("action"):
 			_try_player_sword_attack()
 		return
 
-	if phase == Phase.DEFEND and Input.is_action_just_pressed("action"):
+	if phase == Phase.DEFEND and _replay_action_just_pressed("action"):
 		_try_player_sword_attack()
 
 
@@ -3188,7 +4162,7 @@ func _move_player(delta: float) -> void:
 	if build_menu_open or dealer_menu_open:
 		player_move_velocity = player_move_velocity.move_toward(Vector2.ZERO, PLAYER_DECELERATION * delta)
 		return
-	var move_vector: Vector2 = Input.get_vector("move_left", "move_right", "move_up", "move_down")
+	var move_vector: Vector2 = _replay_get_vector("move_left", "move_right", "move_up", "move_down")
 	player_step_effect_timer = maxf(player_step_effect_timer - delta, 0.0)
 	player_skid_timer = maxf(player_skid_timer - delta, 0.0)
 	player_step_impact = move_toward(player_step_impact, 0.0, delta * 8.0)
@@ -3223,7 +4197,7 @@ func _move_player(delta: float) -> void:
 			move_speed *= 0.68
 		if move_vector.length_squared() > 0.01:
 			player_move_velocity = player_move_velocity.limit_length(move_speed)
-		if shield_unlocked and Input.is_action_just_pressed("repair_wall") and parry_cooldown <= 0.0:
+		if shield_unlocked and _replay_action_just_pressed("repair_wall") and parry_cooldown <= 0.0:
 			parry_timer = PLAYER_PARRY_WINDOW
 			parry_cooldown = PLAYER_PARRY_COOLDOWN
 			_add_overlay_effect(cave_player_position + PLAYER_SIZE * 0.5, "Parry", MAGIC_COLOR)
@@ -3303,6 +4277,7 @@ func _apply_player_damage(damage_amount: int, effect_position: Vector2) -> int:
 		_play_sfx(ui_hover_sound, -22.0, 0.72)
 		return 0
 	player_hp -= damage_amount
+	hp_flinch_timer = UI_ANIM_TIME
 	camera_shake_strength = minf(CAMERA_SHAKE_MAX, camera_shake_strength + 2.2 * screen_shake_percent / 100.0)
 	return damage_amount
 
@@ -3494,18 +4469,18 @@ func _grant_boss_victory_rewards() -> void:
 func _start_boss_rock_slam(boss_enemy: Dictionary) -> void:
 	cave_boss_rock_markers.clear()
 	cave_falling_rocks.clear()
-	var marker_count: int = randi_range(CAVE_BOSS_ROCKFALL_MIN, CAVE_BOSS_ROCKFALL_MAX)
+	var marker_count: int = _simulation_randi_range(CAVE_BOSS_ROCKFALL_MIN, CAVE_BOSS_ROCKFALL_MAX)
 	var cave_bounds: Rect2 = _cave_walk_bounds()
 	var player_center: Vector2 = cave_player_position + PLAYER_SIZE * 0.5
 	var chosen_positions: Array[Vector2] = []
 	for marker_index in range(marker_count):
-		var is_big: bool = marker_index == marker_count - 1 and randf() < 0.55
+		var is_big: bool = marker_index == marker_count - 1 and _simulation_randf() < 0.55
 		var marker_position := Vector2.ZERO
 		var found_spot := false
 		for attempt in range(10):
 			var candidate := Vector2(
-				randf_range(cave_bounds.position.x + 94.0, cave_bounds.end.x - 94.0),
-				randf_range(cave_bounds.position.y + 86.0, cave_bounds.end.y - 76.0)
+				_simulation_randf_range(cave_bounds.position.x + 94.0, cave_bounds.end.x - 94.0),
+				_simulation_randf_range(cave_bounds.position.y + 86.0, cave_bounds.end.y - 76.0)
 			)
 			if candidate.distance_to(player_center) < CAVE_BOSS_MARKER_SAFE_RADIUS and marker_count > 1:
 				continue
@@ -3521,8 +4496,8 @@ func _start_boss_rock_slam(boss_enemy: Dictionary) -> void:
 			break
 		if not found_spot:
 			marker_position = Vector2(
-				randf_range(cave_bounds.position.x + 94.0, cave_bounds.end.x - 94.0),
-				randf_range(cave_bounds.position.y + 86.0, cave_bounds.end.y - 76.0)
+				_simulation_randf_range(cave_bounds.position.x + 94.0, cave_bounds.end.x - 94.0),
+				_simulation_randf_range(cave_bounds.position.y + 86.0, cave_bounds.end.y - 76.0)
 			)
 		chosen_positions.append(marker_position)
 		var impact_radius: float = 30.0 if not is_big else 46.0
@@ -3601,13 +4576,38 @@ func _update_cave_boss_hazards(delta: float) -> bool:
 			"time": CAVE_BOSS_RUBBLE_TIME
 		})
 		_add_explosion_effect(impact_position, impact_radius * 0.72, Color(0.78, 0.48, 0.24, 0.28))
-		_play_sfx(explosion_sound, -7.5, randf_range(0.86, 0.94))
+		_play_sfx(explosion_sound, -7.5, _simulation_randf_range(0.86, 0.94))
 		cave_falling_rocks.remove_at(rock_index)
 	for rubble_index in range(cave_rock_rubble.size() - 1, -1, -1):
 		cave_rock_rubble[rubble_index]["time"] = float(cave_rock_rubble[rubble_index]["time"]) - delta
 		if float(cave_rock_rubble[rubble_index]["time"]) <= 0.0:
 			cave_rock_rubble.remove_at(rubble_index)
 	return true
+
+
+func _cave_miner_steering(miner: Dictionary, player_center: Vector2) -> Vector2:
+	var center: Vector2 = Vector2(miner["position"]) + Vector2(miner["size"]) * 0.5
+	var pursuit: Vector2 = (player_center - center).normalized()
+	var separation := Vector2.ZERO
+	for other in cave_enemies:
+		if is_same(other, miner) or bool(other.get("boss", false)):
+			continue
+		var away: Vector2 = center - (Vector2(other["position"]) + Vector2(other["size"]) * 0.5)
+		var distance: float = away.length()
+		if distance > 0.01 and distance < 54.0:
+			separation += away.normalized() * (1.0 - distance / 54.0)
+	for marker in cave_boss_rock_markers:
+		var away: Vector2 = center - Vector2(marker["position"])
+		var danger_radius: float = float(marker.get("impact_radius", 30.0)) + 28.0
+		if away.length() < danger_radius:
+			miner["ai_thought"] = "Avoid falling rock"
+			var escape: Vector2 = away.normalized() if away.length() > 0.01 else -pursuit
+			miner["ai_direction"] = escape
+			return escape
+	miner["ai_thought"] = "Spread out and pursue" if separation.length_squared() > 0.01 else "Pursue Bob"
+	var direction: Vector2 = (pursuit + separation * 1.5).normalized()
+	miner["ai_direction"] = direction
+	return direction
 
 
 func _update_cave_enemies(delta: float) -> void:
@@ -3682,7 +4682,13 @@ func _update_cave_enemies(delta: float) -> void:
 		elif is_boss and attack_cooldown > 0.0:
 			boss_speed_scale = 0.72
 		if to_player != Vector2.ZERO:
-			cave_enemies[index]["position"] = Vector2(cave_enemies[index]["position"]) + to_player.normalized() * float(cave_enemies[index]["speed"]) * boss_speed_scale * delta
+			var move_direction: Vector2 = to_player.normalized() if is_boss else _cave_miner_steering(cave_enemies[index], player_center)
+			var next_position: Vector2 = Vector2(cave_enemies[index]["position"]) + move_direction * float(cave_enemies[index]["speed"]) * boss_speed_scale * delta
+			if not is_boss:
+				var bounds: Rect2 = _cave_walk_bounds()
+				var enemy_size: Vector2 = Vector2(cave_enemies[index]["size"])
+				next_position = Vector2(clampf(next_position.x, bounds.position.x, bounds.end.x - enemy_size.x), clampf(next_position.y, bounds.position.y, bounds.end.y - enemy_size.y))
+			cave_enemies[index]["position"] = next_position
 		var enemy_rect := Rect2(Vector2(cave_enemies[index]["position"]), Vector2(cave_enemies[index]["size"]))
 		var enemy_distance: float = enemy_center.distance_to(player_center)
 		if is_boss and bool(cave_enemies[index].get("phase_two", false)) and slam_timer <= 0.0 and stun_timer <= 0.0 and slam_cooldown <= 0.0 and cave_boss_rock_markers.is_empty() and cave_falling_rocks.is_empty():
@@ -3985,6 +4991,14 @@ func _add_gather_effect(cell: Vector2i, material_label: String, effect_color: Co
 
 
 func _try_place_structure(structure_type: int, sentry_kind: String = "arrow") -> bool:
+	var placed_cell: Vector2i = selected_cell
+	var placed: bool = _try_place_structure_inner(structure_type, sentry_kind)
+	if placed:
+		_add_ui_stamp(_cell_center(placed_cell), "PAID", true)
+	return placed
+
+
+func _try_place_structure_inner(structure_type: int, sentry_kind: String = "arrow") -> bool:
 	if phase != Phase.BUILD or inside_house or inside_cave:
 		return false
 	if not _cell_is_buildable(selected_cell):
@@ -4447,7 +5461,7 @@ func _spawn_enemies() -> void:
 			enemy_size = Vector2(34, 34)
 		elif enemy_type == "swat":
 			enemy_size = Vector2(32, 32)
-		var entry_cell: Vector2i = Vector2i(2, randi_range(SIDE_SPAWN_ROW_RANGE.x, SIDE_SPAWN_ROW_RANGE.y)) if lane == "left" else Vector2i(GRID_SIZE.x - 3, randi_range(SIDE_SPAWN_ROW_RANGE.x, SIDE_SPAWN_ROW_RANGE.y))
+		var entry_cell: Vector2i = Vector2i(2, _simulation_randi_range(SIDE_SPAWN_ROW_RANGE.x, SIDE_SPAWN_ROW_RANGE.y)) if lane == "left" else Vector2i(GRID_SIZE.x - 3, _simulation_randi_range(SIDE_SPAWN_ROW_RANGE.x, SIDE_SPAWN_ROW_RANGE.y))
 		var entry_target: Vector2 = _cell_center(entry_cell) - enemy_size * 0.5
 		var spawn_position: Vector2 = _side_spawn_position(lane, enemy_size)
 		var enemy_role: String = _enemy_role_for(enemy_type, enemy_spawn_index)
@@ -4466,17 +5480,17 @@ func _spawn_enemies() -> void:
 			"attack_cooldown": 0.0,
 			"attack_windup": 0.0,
 			"flash_timer": 0.0,
-			"wander_offset": randf_range(-26.0, 26.0),
-			"anim_phase": randf_range(0.0, 0.7),
+			"wander_offset": _simulation_randf_range(-26.0, 26.0),
+			"anim_phase": _simulation_randf_range(0.0, 0.7),
 			"spawn_anim": 0.28,
 			"role": enemy_role,
 			"squad_id": int(floor(float(enemy_spawn_index) / 3.0)),
 			"formation_slot": posmod(enemy_spawn_index, 3) - 1,
-			"decision_timer": randf_range(0.12, 0.42),
-			"lane_switch_cooldown": randf_range(1.2, 2.4),
+			"decision_timer": _simulation_randf_range(0.12, 0.42),
+			"lane_switch_cooldown": _simulation_randf_range(1.2, 2.4),
 			"focus_player": false,
 			"dodge_timer": 0.0,
-			"dodge_cooldown": randf_range(0.4, 1.2),
+			"dodge_cooldown": _simulation_randf_range(0.4, 1.2),
 			"dodge_direction": Vector2.ZERO,
 			"ai_nodes": [],
 			"ai_node_index": 0,
@@ -4554,17 +5568,17 @@ func _update_enemy_decision(enemy: Dictionary, delta: float) -> void:
 	enemy["dodge_timer"] = maxf(float(enemy.get("dodge_timer", 0.0)) - delta, 0.0)
 	enemy["dodge_cooldown"] = maxf(float(enemy.get("dodge_cooldown", 0.0)) - delta, 0.0)
 	if float(enemy["decision_timer"]) <= 0.0:
-		enemy["decision_timer"] = randf_range(0.45, 0.85)
+		enemy["decision_timer"] = _simulation_randf_range(0.45, 0.85)
 		var enemy_center: Vector2 = _enemy_center(enemy)
 		var player_distance: float = enemy_center.distance_to(player_position + PLAYER_SIZE * 0.5)
 		var role: String = String(enemy.get("role", "skirmisher"))
 		var pressure_chance: float = 0.0 if round_number <= 2 else clampf(0.06 + float(round_number - 3) * 0.025, 0.06, 0.34)
-		enemy["focus_player"] = role != "breacher" and player_distance < 230.0 and randf() < pressure_chance
+		enemy["focus_player"] = role != "breacher" and player_distance < 230.0 and _simulation_randf() < pressure_chance
 		if float(enemy.get("lane_switch_cooldown", 0.0)) <= 0.0 and round_number >= 3:
 			var weak_lane: String = _weakest_defense_lane()
-			if String(enemy.get("lane", "left")) != weak_lane and randf() < clampf(0.14 + round_number * 0.025, 0.14, 0.48):
+			if String(enemy.get("lane", "left")) != weak_lane and _simulation_randf() < clampf(0.14 + round_number * 0.025, 0.14, 0.48):
 				enemy["lane"] = weak_lane
-				enemy["lane_switch_cooldown"] = randf_range(2.4, 4.2)
+				enemy["lane_switch_cooldown"] = _simulation_randf_range(2.4, 4.2)
 	if round_number >= 2 and float(enemy.get("dodge_cooldown", 0.0)) <= 0.0 and String(enemy.get("role", "")) != "breacher":
 		var enemy_center: Vector2 = _enemy_center(enemy)
 		for projectile in projectiles:
@@ -4578,12 +5592,12 @@ func _update_enemy_decision(enemy: Dictionary, delta: float) -> void:
 			var dodge_skill: float = clampf(0.18 + float(round_number) * 0.025, 0.18, 0.54)
 			if String(enemy.get("type", "runner")) == "swat":
 				dodge_skill = minf(0.82, dodge_skill + 0.26)
-			if randf() > dodge_skill:
+			if _simulation_randf() > dodge_skill:
 				enemy["dodge_cooldown"] = 0.28
 				break
-			enemy["dodge_direction"] = Vector2(-projectile_direction.y, projectile_direction.x) * (-1.0 if randf() < 0.5 else 1.0)
+			enemy["dodge_direction"] = Vector2(-projectile_direction.y, projectile_direction.x) * (-1.0 if _simulation_randf() < 0.5 else 1.0)
 			enemy["dodge_timer"] = 0.18
-			enemy["dodge_cooldown"] = randf_range(1.1, 2.0)
+			enemy["dodge_cooldown"] = _simulation_randf_range(1.1, 2.0)
 			enemy["ai_thought"] = "Incoming shot — sidestepping"
 			break
 
@@ -4779,7 +5793,7 @@ func _kill_enemy(index: int) -> void:
 	_add_explosion_effect(_enemy_center(enemies[index]), 18.0 if enemy_type == "runner" else 24.0, Color(0.82, 0.24, 0.20))
 	_add_hit_effect(_enemy_center(enemies[index]), "DOWN", Color(1.0, 0.86, 0.72))
 	run_enemies_defeated += 1
-	_play_sfx(explosion_sound, -15.0 if enemy_type == "runner" else -11.5, randf_range(1.06, 1.18) if enemy_type == "runner" else randf_range(0.86, 0.96))
+	_play_sfx(explosion_sound, -15.0 if enemy_type == "runner" else -11.5, _simulation_randf_range(1.06, 1.18) if enemy_type == "runner" else _simulation_randf_range(0.86, 0.96))
 	enemies.remove_at(index)
 
 
@@ -4874,11 +5888,11 @@ func _update_turrets(delta: float) -> void:
 				"flight_progress": 0.0
 			})
 			if fired_weapon == "cannon":
-				_play_sfx(explosion_sound, -10.0, randf_range(0.92, 1.00))
+				_play_sfx(explosion_sound, -10.0, _simulation_randf_range(0.92, 1.00))
 			elif fired_weapon == "arrow" or fired_weapon == "golden" or fired_weapon == "rifle":
-				_play_sfx(crossbow_sound, -11.5, randf_range(0.96, 1.04))
+				_play_sfx(crossbow_sound, -11.5, _simulation_randf_range(0.96, 1.04))
 			else:
-				_play_sfx(gunshot_sound, -13.0, randf_range(0.96, 1.04))
+				_play_sfx(gunshot_sound, -13.0, _simulation_randf_range(0.96, 1.04))
 
 
 func _turret_target_score(structure: Dictionary, enemy_index: int, distance: float, turret_range: float) -> float:
@@ -5225,7 +6239,7 @@ func _fire_player_gun(gun_name: String, target_index: int, gun_range: float, fir
 		"direction": shot_direction
 	})
 	_add_explosion_effect(player_center + shot_direction * 16.0, 8.0 if gun_name == "sidearm" else 11.0, projectile_color)
-	_play_sfx(gunshot_sound, -11.5 if gun_name == "rifle" else -13.5, randf_range(0.97, 1.05))
+	_play_sfx(gunshot_sound, -11.5 if gun_name == "rifle" else -13.5, _simulation_randf_range(0.97, 1.05))
 
 
 func _update_projectiles(delta: float) -> void:
@@ -5263,7 +6277,7 @@ func _update_projectiles(delta: float) -> void:
 					_damage_enemies_in_radius(target_center, landing_splash_radius, landing_damage, Color(projectiles[index]["color"]))
 					_add_explosion_effect(target_center, landing_splash_radius, Color(projectiles[index]["color"]))
 					_add_hit_effect(target_center, "BOOM", Color(projectiles[index]["color"]))
-					_play_sfx(explosion_sound, -7.0, randf_range(0.94, 1.02))
+					_play_sfx(explosion_sound, -7.0, _simulation_randf_range(0.94, 1.02))
 				else:
 					if target_index != -1:
 						enemies[target_index]["hp"] = int(enemies[target_index]["hp"]) - landing_damage
@@ -5316,7 +6330,7 @@ func _apply_camera_shake(delta: float) -> void:
 	if camera_shake_strength <= 0.01:
 		camera_shake_strength = 0.0
 		return
-	var shake_offset := Vector2(randf_range(-camera_shake_strength, camera_shake_strength), randf_range(-camera_shake_strength, camera_shake_strength)).round()
+	var shake_offset := Vector2(_simulation_randf_range(-camera_shake_strength, camera_shake_strength), _simulation_randf_range(-camera_shake_strength, camera_shake_strength)).round()
 	camera_position += shake_offset
 	camera_shake_strength = move_toward(camera_shake_strength, 0.0, CAMERA_SHAKE_DECAY * delta)
 
@@ -5353,22 +6367,22 @@ func _spawn_motion_burst(position: Vector2, color: Color, count: int, min_speed:
 	var particle_cap: int = 360 if effects_quality_high else 150
 	adjusted_count = mini(adjusted_count, maxi(0, particle_cap - motion_effects.size()))
 	for particle_index in range(adjusted_count):
-		var angle: float = randf_range(0.0, TAU)
+		var angle: float = _simulation_randf_range(0.0, TAU)
 		if kind == "dust":
-			angle = randf_range(PI * 1.08, PI * 1.92)
-		var speed: float = randf_range(min_speed, max_speed)
-		var particle_time: float = randf_range(MOTION_SPARK_TIME * 0.72, MOTION_SPARK_TIME * 1.18)
+			angle = _simulation_randf_range(PI * 1.08, PI * 1.92)
+		var speed: float = _simulation_randf_range(min_speed, max_speed)
+		var particle_time: float = _simulation_randf_range(MOTION_SPARK_TIME * 0.72, MOTION_SPARK_TIME * 1.18)
 		motion_effects.append({
 			"kind": kind,
-			"position": position + Vector2(randf_range(-3.0, 3.0), randf_range(-2.0, 2.0)),
+			"position": position + Vector2(_simulation_randf_range(-3.0, 3.0), _simulation_randf_range(-2.0, 2.0)),
 			"velocity": Vector2.RIGHT.rotated(angle) * speed,
 			"color": color,
-			"size": randf_range(1.8, 3.8) if kind == "spark" else randf_range(2.5, 5.0),
+			"size": _simulation_randf_range(1.8, 3.8) if kind == "spark" else _simulation_randf_range(2.5, 5.0),
 			"time": particle_time,
 			"total": particle_time,
 			"screen_space": screen_space,
-			"spin": randf_range(-8.0, 8.0),
-			"rotation": randf_range(0.0, TAU)
+			"spin": _simulation_randf_range(-8.0, 8.0),
+			"rotation": _simulation_randf_range(0.0, TAU)
 		})
 
 
@@ -5428,8 +6442,76 @@ func _draw_motion_effects() -> void:
 			draw_line(center - tail, center + tail * 0.15, draw_color, maxf(1.0, size * life_ratio), true)
 
 
+func _update_ui_motion(delta: float) -> void:
+	if phase != ui_last_phase:
+		ui_last_phase = phase
+		if phase == Phase.MENU or phase == Phase.GAME_OVER:
+			menu_title_stamp_elapsed = 0.0
+	if team_intro_active:
+		menu_title_stamp_elapsed = 0.0
+	else:
+		menu_title_stamp_elapsed += delta
+	iris_open_timer = maxf(iris_open_timer - delta, 0.0)
+	hp_flinch_timer = maxf(hp_flinch_timer - delta, 0.0)
+	ui_panel_open_elapsed += delta
+	_update_ui_stamps(delta)
+	if title_label != null:
+		# Player pick: the health number flinches (shakes and flashes red) on each hit.
+		var flinch: float = hp_flinch_timer / UI_ANIM_TIME
+		var shake_x: float = sin(hp_flinch_timer * 70.0) * 6.0 * flinch
+		title_label.position = Vector2(60.0 + shake_x, 18.0)
+		title_label.self_modulate = Color.WHITE.lerp(Color(1.0, 0.32, 0.30), flinch)
+		if hud_heart_icon != null:
+			hud_heart_icon.position = Vector2(24.0 + shake_x, 17.0)
+			hud_heart_icon.scale = Vector2.ONE * (1.0 + 0.25 * flinch)
+	if music_credit_panel != null and music_credit_panel.visible:
+		# Song credit slides in from the right when a track starts and slides out before hiding.
+		var shown_for: float = world_time - (music_credit_hide_at - MUSIC_CREDIT_TOAST_TIME)
+		var left_in: float = music_credit_hide_at - world_time
+		var slide: float = clampf(minf(shown_for, left_in) / UI_ANIM_TIME, 0.0, 1.0)
+		var eased_slide: float = 1.0 - pow(1.0 - slide, 3.0)
+		music_credit_panel.position.x = lerpf(SCREEN_SIZE.x + 8.0, 886.0, eased_slide)
+	if menu_title_label != null and menu_title_label.visible:
+		_apply_title_stamp(menu_title_label, menu_title_stamp_elapsed)
+
+
+# Rubber-stamp slam: drops in large, overshoots small, then settles slightly tilted.
+func _apply_title_stamp(label: Label, elapsed: float) -> void:
+	label.pivot_offset = label.size * 0.5
+	var t: float = clampf(elapsed / UI_STAMP_TIME, 0.0, 1.0)
+	var scale_value: float
+	if t < 0.55:
+		scale_value = lerpf(2.6, 0.92, pow(t / 0.55, 2.2))
+	else:
+		scale_value = lerpf(0.92, 1.0, sin((t - 0.55) / 0.45 * PI * 0.5))
+	label.scale = Vector2.ONE * scale_value
+	label.rotation = lerpf(-0.11, -0.03, t)
+	label.modulate.a = clampf(t / 0.3, 0.0, 1.0)
+	if t >= 1.0 and elapsed - UI_STAMP_TIME < 0.18:
+		var shake: float = (1.0 - (elapsed - UI_STAMP_TIME) / 0.18) * 3.0
+		label.position.x = 72.0 + sin(elapsed * 90.0) * shake
+	else:
+		label.position.x = 72.0
+
+
+func _start_iris_open() -> void:
+	iris_open_timer = UI_IRIS_TIME
+
+
+func _draw_iris_open() -> void:
+	if iris_open_timer <= 0.0:
+		return
+	var t: float = 1.0 - iris_open_timer / UI_IRIS_TIME
+	var eased: float = 1.0 - pow(1.0 - t, 3.0)
+	var center: Vector2 = player_position - camera_position
+	var outer: float = SCREEN_SIZE.length() + center.distance_to(SCREEN_SIZE * 0.5)
+	var hole: float = lerpf(0.0, outer, eased)
+	# A thick ring whose inner edge is the hole covers everything outside it.
+	draw_arc(center, (hole + outer) * 0.5, 0.0, TAU, 96, Color.BLACK, outer - hole + 2.0, true)
+
+
 func _draw_scene_transition() -> void:
-	if phase_transition_timer <= 0.0:
+	if phase_transition_timer <= 0.0 or iris_open_timer > 0.0:
 		return
 	var remaining: float = clampf(phase_transition_timer / PHASE_TRANSITION_TIME, 0.0, 1.0)
 	var progress: float = 1.0 - remaining
@@ -5504,6 +6586,82 @@ func _style_menu_art_button(button: Button, region: Rect2) -> void:
 	button.add_theme_stylebox_override("disabled", _make_flat_style(Color(0, 0, 0, 0.30), Color(1, 1, 1, 0.10), 1, 8))
 
 
+# Player pick: Settings shares the in-game tax-form paper look.
+func _paperize_settings_panel() -> void:
+	if menu_settings_panel == null:
+		return
+	menu_settings_panel.color = UI_PAPER_FILL
+	ui_paper_active = true
+	var pending: Array[Node] = [menu_settings_panel]
+	while not pending.is_empty():
+		var node: Node = pending.pop_back()
+		pending.append_array(node.get_children())
+		if node is Label:
+			var label := node as Label
+			var label_color: Color = label.modulate * label.get_theme_color("font_color")
+			label.modulate = Color.WHITE
+			label.add_theme_color_override("font_color", _paper_ink(label_color))
+			label.add_theme_color_override("font_shadow_color", Color(0, 0, 0, 0))
+		elif node is Panel:
+			var card_style := (node as Panel).get_theme_stylebox("panel") as StyleBoxFlat
+			if card_style != null:
+				var paper_style := card_style.duplicate() as StyleBoxFlat
+				paper_style.bg_color = UI_PAPER_CARD
+				paper_style.border_color = Color(_paper_ink(Color(card_style.border_color, 1.0)), 0.7)
+				(node as Panel).add_theme_stylebox_override("panel", paper_style)
+	ui_paper_active = false
+
+
+# Player pick: Pixelify Sans (SIL OFL, assets/fonts) for all UI text. Every Control and
+# every draw_string call reads ThemeDB.fallback_font, so swapping it restyles both.
+func _apply_ui_font() -> void:
+	var pixel_font := load(UI_FONT_PATH) as FontFile
+	if pixel_font == null:
+		return
+	var weighted := FontVariation.new()
+	weighted.base_font = pixel_font
+	var text_server := TextServerManager.get_primary_interface()
+	weighted.variation_opentype = {text_server.name_to_tag("wght"): 500}
+	# The font's "fi" ligature reads as a stray glyph at UI sizes.
+	weighted.opentype_features = {text_server.name_to_tag("liga"): 0, text_server.name_to_tag("calt"): 0}
+	# Silkscreen ships with wide built-in tracking; tighten it so existing layouts fit.
+	weighted.spacing_glyph = -2
+	weighted.spacing_space = -3
+	ThemeDB.fallback_font = weighted
+	# HUD Controls hang off this Node2D, so they never see a Window theme; they fall
+	# back to the engine default theme instead.
+	ThemeDB.get_default_theme().default_font = weighted
+
+
+func _style_paper_checkbox(button: Button) -> void:
+	for state in ["normal", "hover", "pressed", "focus"]:
+		var style := _make_flat_style(UI_PAPER_FILL if state != "pressed" else UI_PAPER_FILL.darkened(0.06), UI_PAPER_INK if state != "focus" else UI_COOL_ACCENT, 2 if state != "focus" else 3, 3)
+		style.shadow_color = Color(0, 0, 0, 0.45)
+		style.shadow_size = 0
+		style.shadow_offset = Vector2(0, 4)
+		button.add_theme_stylebox_override(state, style)
+	button.add_theme_stylebox_override("disabled", _make_flat_style(UI_PAPER_FILL.darkened(0.3), UI_PAPER_INK, 1, 3))
+	for color_name in ["font_color", "font_hover_color", "font_pressed_color", "font_focus_color"]:
+		button.add_theme_color_override(color_name, UI_PAPER_INK)
+	button.add_theme_font_size_override("font_size", 19)
+
+
+# Stack the plank buttons under the title once the help text is gone.
+func _layout_menu_home(top_y: float, show_dev: bool) -> void:
+	var y := top_y
+	menu_start_button.position = Vector2(326, y)
+	y += 70.0
+	menu_settings_button.position = Vector2(326, y)
+	y += 74.0
+	if show_dev:
+		menu_dev_button.position = Vector2(345, y)
+		menu_dev_button.size = Vector2(262, 55)
+		menu_dev_button.pivot_offset = menu_dev_button.size * 0.5
+		y += 72.0
+	menu_tutorial_button.position = Vector2(346, y + 6.0)
+	menu_tutorial_button.size = Vector2(260, 44)
+
+
 func _style_text_input(line_edit: LineEdit) -> void:
 	line_edit.add_theme_stylebox_override("normal", _make_flat_style(Color(0.08, 0.10, 0.12, 0.96), UI_PANEL_BORDER, 2, 12))
 	line_edit.add_theme_stylebox_override("focus", _make_flat_style(Color(0.10, 0.12, 0.15, 0.98), UI_WARM_ACCENT, 2, 12))
@@ -5513,9 +6671,128 @@ func _style_text_input(line_edit: LineEdit) -> void:
 
 
 func _draw_ui_card(rect: Rect2, accent: Color = UI_PANEL_BORDER, fill: Color = UI_PANEL_FILL, border_width: float = 2.0, shadow_offset: Vector2 = Vector2(0, 8)) -> void:
+	if ui_paper_active:
+		var is_sheet: bool = rect.size.x >= 400.0 and rect.size.y >= 300.0
+		var paper_shadow: Vector2 = shadow_offset if is_sheet else Vector2(0, minf(shadow_offset.y, 3.0))
+		draw_rect(Rect2(rect.position + paper_shadow, rect.size), Color(0, 0, 0, 0.42 if is_sheet else 0.14), true)
+		_prect(rect, fill, true)
+		if rect.size.x >= 400.0 and rect.size.y >= 300.0:
+			var line_y: float = rect.position.y + 30.0
+			while line_y < rect.end.y - 6.0:
+				_pline(Vector2(rect.position.x + 8, line_y), Vector2(rect.end.x - 8, line_y), Color(0.70, 0.62, 0.46, 0.28), 1.0)
+				line_y += 24.0
+		_prect(rect, accent, false, border_width)
+		return
 	draw_rect(Rect2(rect.position + shadow_offset, rect.size), UI_PANEL_SHADOW, true)
 	draw_rect(rect, fill, true)
 	draw_rect(rect, accent, false, border_width)
+
+
+# Player pick: in-game panels look like tax-form paper. Panel code keeps its dark-UI
+# colors; these helpers translate them to ink-on-paper while ui_paper_active is set.
+func _paper_ink(color: Color) -> Color:
+	if not ui_paper_active:
+		return color
+	if color.r > 0.9 and color.g > 0.9 and color.b > 0.9 and color.a < 0.4:
+		return Color(UI_PAPER_INK, minf(color.a * 2.6, 0.55))
+	if color.s < 0.28 and color.get_luminance() > 0.45:
+		# Neutral light text becomes ink; dimmer neutrals become faded ink.
+		return Color(UI_PAPER_INK if color.get_luminance() > 0.8 else UI_PAPER_MUTED, color.a)
+	if color.get_luminance() > 0.45:
+		return Color(color.darkened(0.6), color.a)
+	return color
+
+
+func _paper_fill(color: Color) -> Color:
+	if not ui_paper_active or color.get_luminance() > 0.32 or color.a < 0.3:
+		return _paper_ink(color)
+	var tone: float = clampf(color.get_luminance() / 0.28, 0.0, 1.0)
+	var paper: Color = UI_PAPER_CARD.lerp(UI_PAPER_FILL.darkened(0.10), tone)
+	# Keep a hint of the original hue so owned/selected states still read.
+	if color.s > 0.25:
+		# Keep a hint of the original hue so owned/selected states still read.
+		paper = paper.lerp(Color(color.r * 3.0, color.g * 3.0, color.b * 3.0).clamp(), 0.14)
+	return Color(paper, maxf(color.a, 0.96))
+
+
+func _pstr(font: Font, pos: Vector2, text: String, alignment: HorizontalAlignment = HORIZONTAL_ALIGNMENT_LEFT, width: float = -1, font_size: int = 16, modulate: Color = Color.WHITE) -> void:
+	draw_string(font, pos, text, alignment, width, font_size, _paper_ink(modulate))
+
+
+func _pmstr(font: Font, pos: Vector2, text: String, alignment: HorizontalAlignment = HORIZONTAL_ALIGNMENT_LEFT, width: float = -1, font_size: int = 16, max_lines: int = -1, modulate: Color = Color.WHITE) -> void:
+	draw_multiline_string(font, pos, text, alignment, width, font_size, max_lines, _paper_ink(modulate))
+
+
+func _prect(rect: Rect2, color: Color, filled: bool = true, width: float = -1.0) -> void:
+	if filled:
+		draw_rect(rect, _paper_fill(color), true)
+	else:
+		draw_rect(rect, _paper_ink(color), false, width)
+
+
+func _pline(from: Vector2, to: Vector2, color: Color, width: float = -1.0, antialiased: bool = false) -> void:
+	draw_line(from, to, _paper_ink(color), width, antialiased)
+
+
+func _pxform(position: Vector2, rotation: float = 0.0, scale: Vector2 = Vector2.ONE) -> void:
+	draw_set_transform_matrix(ui_panel_xform * Transform2D(rotation, scale, 0.0, position))
+
+
+func _draw_paper_panels() -> void:
+	var any_open: bool = dealer_menu_open or build_menu_open or inventory_menu_open
+	if any_open and not ui_panel_was_open:
+		ui_panel_open_elapsed = 0.0
+	ui_panel_was_open = any_open
+	if not any_open:
+		return
+	# Player pick: panels pop open with a small overshoot.
+	var t: float = clampf(ui_panel_open_elapsed / UI_ANIM_TIME, 0.0, 1.0)
+	var back: float = 1.70158
+	var eased: float = 1.0 + (back + 1.0) * pow(t - 1.0, 3.0) + back * pow(t - 1.0, 2.0)
+	var scale_value: float = lerpf(0.82, 1.0, eased)
+	var pivot: Vector2 = SCREEN_SIZE * 0.5
+	ui_panel_xform = Transform2D(0.0, Vector2.ONE * scale_value, 0.0, pivot - pivot * scale_value)
+	ui_paper_active = true
+	draw_set_transform_matrix(ui_panel_xform)
+	_draw_dealer_menu()
+	_draw_build_menu()
+	_draw_inventory_menu()
+	_draw_ui_stamps(true)
+	ui_paper_active = false
+	ui_panel_xform = Transform2D.IDENTITY
+	draw_set_transform_matrix(Transform2D.IDENTITY)
+
+
+func _add_ui_stamp(center: Vector2, text: String, world_space: bool) -> void:
+	ui_stamps.append({"center": center, "text": text, "time": 0.0, "world": world_space})
+
+
+func _update_ui_stamps(delta: float) -> void:
+	for stamp in ui_stamps:
+		stamp["time"] = float(stamp["time"]) + delta
+	ui_stamps = ui_stamps.filter(func(stamp): return float(stamp["time"]) < UI_STAMP_LIFE)
+
+
+func _draw_ui_stamps(panel_pass: bool) -> void:
+	var font := ThemeDB.fallback_font
+	for stamp in ui_stamps:
+		if bool(stamp["world"]) == panel_pass:
+			continue
+		var t: float = float(stamp["time"])
+		var slam: float = clampf(t / 0.12, 0.0, 1.0)
+		var stamp_scale: float = lerpf(2.4, 1.0, 1.0 - pow(1.0 - slam, 3.0))
+		var alpha: float = clampf((UI_STAMP_LIFE - t) / 0.25, 0.0, 1.0) * clampf(t / 0.05, 0.0, 1.0)
+		var center: Vector2 = Vector2(stamp["center"])
+		if bool(stamp["world"]):
+			center -= camera_position
+		var base := ui_panel_xform if panel_pass else Transform2D.IDENTITY
+		draw_set_transform_matrix(base * Transform2D(-0.2, Vector2.ONE * stamp_scale, 0.0, center))
+		var text: String = String(stamp["text"])
+		var box := Rect2(Vector2(-58, -22), Vector2(116, 44))
+		draw_rect(box, Color(UI_STAMP_RED, 0.14 * alpha), true)
+		draw_rect(box, Color(UI_STAMP_RED, 0.92 * alpha), false, 3.0)
+		draw_string(font, Vector2(-58, 10), text, HORIZONTAL_ALIGNMENT_CENTER, 116, 26, Color(UI_STAMP_RED, alpha))
+	draw_set_transform_matrix(ui_panel_xform if panel_pass else Transform2D.IDENTITY)
 
 
 func _with_alpha(color: Color, alpha: float) -> Color:
@@ -5608,7 +6885,7 @@ func _enemy_center(enemy: Dictionary) -> Vector2:
 
 
 func _side_spawn_position(lane: String, enemy_size: Vector2) -> Vector2:
-	var spawn_row: int = randi_range(SIDE_SPAWN_ROW_RANGE.x, SIDE_SPAWN_ROW_RANGE.y)
+	var spawn_row: int = _simulation_randi_range(SIDE_SPAWN_ROW_RANGE.x, SIDE_SPAWN_ROW_RANGE.y)
 	var spawn_y: float = _cell_center(Vector2i(0, spawn_row)).y - enemy_size.y * 0.5
 	var spawn_x: float = GRID_ORIGIN.x - SIDE_SPAWN_OFFSET_X if lane == "left" else GRID_ORIGIN.x + GRID_SIZE.x * CELL_SIZE + SIDE_SPAWN_OFFSET_X - enemy_size.x
 	return Vector2(spawn_x, spawn_y)
@@ -5635,26 +6912,6 @@ func _cell_center(cell: Vector2i) -> Vector2:
 
 func _cell_key(cell: Vector2i) -> String:
 	return "%s:%s" % [cell.x, cell.y]
-
-
-func _draw_grid() -> void:
-	var visible_start_y: int = maxi(0, int(floor(camera_position.y / CELL_SIZE)) - 1)
-	var visible_end_y: int = int(ceil((camera_position.y + SCREEN_SIZE.y) / CELL_SIZE)) + 1
-	for y in range(visible_start_y, visible_end_y):
-		for x in range(GRID_SIZE.x):
-			var cell := Vector2i(x, y)
-			var world_rect := Rect2(_cell_to_world(cell), Vector2.ONE * CELL_SIZE)
-			if cell in HOUSE_BLOCK_CELLS:
-				continue
-			var should_draw_outline := false
-			if cell in LEFT_BUILD_YARD or cell in RIGHT_BUILD_YARD:
-				should_draw_outline = true
-			if _cell_is_path(cell):
-				_draw_world_rect(world_rect, PATH_COLOR)
-				should_draw_outline = true
-			if should_draw_outline:
-				var outline_color: Color = Color(0.62, 0.68, 0.74, 0.82) if (cell in LEFT_BUILD_YARD or cell in RIGHT_BUILD_YARD) else GRID_LINE_COLOR
-				draw_rect(Rect2(world_rect.position - camera_position, world_rect.size), outline_color, false, 2.0)
 
 
 func _draw_world_callouts() -> void:
@@ -5779,48 +7036,12 @@ func _lane_has_enemy_inbound(lane: String) -> bool:
 	return false
 
 
-func _draw_waving_grass() -> void:
-	var visible_start_y: int = maxi(0, int(floor(camera_position.y / CELL_SIZE)) - 1)
-	var visible_end_y: int = int(ceil((camera_position.y + SCREEN_SIZE.y) / CELL_SIZE)) + 1
-	for y in range(visible_start_y, visible_end_y):
-		for x in range(GRID_SIZE.x):
-			var cell := Vector2i(x, y)
-			if _cell_is_path(cell) or cell in HOUSE_BLOCK_CELLS:
-				continue
-			var base_world := _cell_to_world(cell)
-			var patch_seed := (x * 31 + y * 17) % 11
-			var sway_phase: float = float((x * 19 + y * 23) % 29) * 0.17
-			var sway: float = sin(world_time * 1.9 + sway_phase) * 2.2
-			var draw_pos := base_world + Vector2(11 + sway, 30 + patch_seed % 4) - camera_position
-			if decor_sprite_texture != null:
-				var use_sunflowers := cell.y < 9 and patch_seed in [0, 5]
-				var decor_region := DECOR_SUNFLOWER_REGION if use_sunflowers else DECOR_GRASS_REGION
-				var decor_size := DECOR_SUNFLOWER_DRAW_SIZE if use_sunflowers else DECOR_GRASS_DRAW_SIZE
-				draw_texture_rect_region(
-					decor_sprite_texture,
-					Rect2(draw_pos, decor_size),
-					decor_region
-				)
-			else:
-				var blade_color := WOODS_COLOR.lightened(0.16) if cell.y >= 9 else GRASS_COLOR.lightened(0.22)
-				for blade_index in range(3):
-					var blade_base := base_world + Vector2(10 + blade_index * 11, 38 + int((x + y + blade_index) % 4))
-					var phase_offset := float(x * 13 + y * 7 + blade_index * 19) * 0.11
-					var blade_sway := sin(world_time * 2.4 + phase_offset) * (4.0 + blade_index)
-					var blade_tip := blade_base + Vector2(blade_sway, -10.0 - blade_index * 2.0)
-					draw_line(blade_base - camera_position, blade_tip - camera_position, blade_color, 2.0)
-
-
 func _draw_house() -> void:
 	var house_rect := Rect2(_cell_center(HOUSE_CELL) - Vector2(44, 34), Vector2(88, 68))
+	# The house art is a Sprite2D in $WorldSpriteLayer. The damage overlay and
+	# repair marker below are procedural, so they stay on this canvas item.
 	var current_texture := _current_house_texture()
-	if current_texture != null:
-		var texture_rect := Rect2(
-			_cell_center(HOUSE_CELL) + HOUSE_DRAW_OFFSET - camera_position,
-			HOUSE_DRAW_SIZE
-		)
-		draw_texture_rect(current_texture, texture_rect, false)
-	else:
+	if current_texture == null:
 		var body_color := HOUSE_DANGER_COLOR if house_flash_timer > 0.0 else HOUSE_COLOR
 		_draw_world_rect(house_rect, body_color)
 		var roof_left := house_rect.position + Vector2(-8, 12)
@@ -5946,22 +7167,12 @@ func _draw_resources() -> void:
 		if index == harvesting_node_index:
 			var harvest_intensity: float = 0.45 + 0.55 * clampf(harvest_timer / maxf(0.01, _current_gather_time()), 0.0, 1.0)
 			harvest_jitter = Vector2(sin(world_time * 42.0), cos(world_time * 33.0) * 0.45) * 2.6 * harvest_intensity
+		# Tree, trunk and rock art are Sprite2D nodes in $WorldSpriteLayer now.
+		# What stays here is the no-texture fallback plus the charge pips and
+		# harvest readout, which are procedural shapes rather than sprites.
 		if node_kind == "wood":
-			if forest_tree_texture != null and int(node["remaining"]) > 0:
-				var tree_draw_rect := Rect2(_cell_to_world(node["cell"]) + Vector2(-42, -100) + harvest_jitter, FOREST_TREE_DRAW_SIZE)
-				draw_texture_rect(
-					forest_tree_texture,
-					Rect2(tree_draw_rect.position - camera_position, tree_draw_rect.size),
-					false
-				)
-			elif tree_trunk_texture != null:
-				var trunk_draw_rect := Rect2(_cell_to_world(node["cell"]) + Vector2(8, 16) + harvest_jitter, Vector2(34, 34))
-				draw_texture_rect(
-					tree_trunk_texture,
-					Rect2(trunk_draw_rect.position - camera_position, trunk_draw_rect.size),
-					false
-				)
-			else:
+			var wood_has_sprite: bool = (forest_tree_texture != null and int(node["remaining"]) > 0) or tree_trunk_texture != null
+			if not wood_has_sprite:
 				var trunk := Rect2(_cell_to_world(node["cell"]) + Vector2(20, 24), Vector2(8, 18))
 				var leaves_color := node_color if int(node["remaining"]) > 0 else Color(0.31, 0.34, 0.26)
 				var leaves := Rect2(_cell_to_world(node["cell"]) + Vector2(6, 2), Vector2(36, 28))
@@ -5971,25 +7182,12 @@ func _draw_resources() -> void:
 					_draw_world_rect(Rect2(_cell_to_world(node["cell"]) + Vector2(14, 30), Vector2(20, 10)), Color(0.42, 0.30, 0.18))
 		else:
 			var rock_variant := (node_cell.x + node_cell.y) % 3
-			if rock_variant == 0 and rock_big_texture != null:
-				draw_texture_rect(
-					rock_big_texture,
-					Rect2(_cell_to_world(node["cell"]) + Vector2(9, 14) + harvest_jitter - camera_position, ROCK_BIG_DRAW_SIZE),
-					false
-				)
-			elif rock_variant == 1 and rock_medium_texture != null:
-				draw_texture_rect(
-					rock_medium_texture,
-					Rect2(_cell_to_world(node["cell"]) + Vector2(11, 20) + harvest_jitter - camera_position, ROCK_MEDIUM_DRAW_SIZE),
-					false
-				)
-			elif rock_small_texture != null:
-				draw_texture_rect(
-					rock_small_texture,
-					Rect2(_cell_to_world(node["cell"]) + Vector2(15, 24) + harvest_jitter - camera_position, ROCK_SMALL_DRAW_SIZE),
-					false
-				)
-			else:
+			var rock_has_sprite: bool = (
+				(rock_variant == 0 and rock_big_texture != null)
+				or (rock_variant == 1 and rock_medium_texture != null)
+				or rock_small_texture != null
+			)
+			if not rock_has_sprite:
 				_draw_world_rect(node_rect, node_color)
 		var charges := int(node["remaining"])
 		for pip in range(charges):
@@ -5998,14 +7196,9 @@ func _draw_resources() -> void:
 			var progress := harvest_timer / _current_gather_time()
 			draw_rect(Rect2(node_rect.position - camera_position + Vector2(0, -14), Vector2(36 * progress, 5)), node_color.lightened(0.35), true)
 			draw_rect(Rect2(node_rect.position - camera_position + Vector2(-2, -2), node_rect.size + Vector2(4, 4)), Color(1, 1, 1, 0.65), false, 2.0)
+	# The cave mouth art is a Sprite2D in $WorldSpriteLayer; this is its fallback.
 	var cave_rect := Rect2(_cell_to_world(CAVE_ENTRANCE_CELL) + Vector2(2, 2), Vector2(44, 44))
-	if cave_entrance_texture != null:
-		draw_texture_rect(
-			cave_entrance_texture,
-			Rect2(cave_rect.position + Vector2(-10, -18) - camera_position, Vector2(64, 72)),
-			false
-		)
-	else:
+	if cave_entrance_texture == null:
 		_draw_world_rect(cave_rect, Color(0.12, 0.11, 0.10))
 		_draw_world_rect(Rect2(cave_rect.position + Vector2(8, 10), Vector2(28, 24)), Color(0.04, 0.04, 0.05))
 		draw_rect(Rect2(cave_rect.position - camera_position, cave_rect.size), Color(0.46, 0.38, 0.28), false, 2.0)
@@ -6022,21 +7215,15 @@ func _draw_forest_animals() -> void:
 			continue
 		var animal_kind: String = String(animal.get("kind", "dog"))
 		var animal_texture: Texture2D = _forest_animal_texture(animal_kind)
+		# $WorldSpriteLayer owns the animal sprite, its sway, bob, facing flip
+		# and its ground shadow. Only the no-texture fallback is drawn here.
+		if animal_texture != null:
+			continue
 		var animal_size: Vector2 = _forest_animal_draw_size(animal_kind)
-		var animal_sway: float = sin(world_time * 3.0 + float(animal.get("bob_phase", 0.0))) * 1.6
-		var animal_step: float = sin(world_time * 6.2 + float(animal.get("bob_phase", 0.0)))
-		var animal_bob: float = absf(animal_step) * 2.0
 		var animal_draw_rect: Rect2 = Rect2(animal_position + Vector2(-animal_size.x * 0.5, -animal_size.y + 8.0), animal_size)
 		var shadow_rect: Rect2 = Rect2(animal_position + Vector2(-animal_size.x * 0.28, 6.0), Vector2(animal_size.x * 0.56, 12.0))
 		draw_rect(Rect2(shadow_rect.position - camera_position, shadow_rect.size), Color(0.02, 0.03, 0.04, 0.18), true)
-		if animal_texture != null:
-			var facing_left: bool = bool(animal.get("facing_left", false))
-			var animal_scale := Vector2((-1.0 if facing_left else 1.0) * (1.0 + animal_step * 0.025), 1.0 - animal_step * 0.018)
-			draw_set_transform(animal_draw_rect.position - camera_position + animal_draw_rect.size * 0.5 + Vector2(animal_sway * 0.2, -animal_bob), animal_sway * 0.008, animal_scale)
-			draw_texture_rect(animal_texture, Rect2(-animal_draw_rect.size * 0.5, animal_draw_rect.size), false)
-			draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
-		else:
-			draw_rect(Rect2(animal_draw_rect.position - camera_position, animal_draw_rect.size), Color(0.74, 0.62, 0.36), true)
+		draw_rect(Rect2(animal_draw_rect.position - camera_position, animal_draw_rect.size), Color(0.74, 0.62, 0.36), true)
 
 
 func _forest_animal_texture(animal_kind: String) -> Texture2D:
@@ -6482,6 +7669,11 @@ func _draw_energy_drink_status() -> void:
 func _draw_danger_overlay() -> void:
 	if phase == Phase.MENU or phase == Phase.GAME_OVER:
 		return
+	if hp_flinch_timer > 0.0:
+		var flash: float = hp_flinch_timer / UI_ANIM_TIME
+		for band in range(4):
+			var inset: float = band * 14.0
+			draw_rect(Rect2(Vector2(inset, inset), SCREEN_SIZE - Vector2(inset, inset) * 2.0), Color(0.86, 0.08, 0.08, 0.34 * flash * (1.0 - band * 0.24)), false, 14.0)
 	if not low_health_warning_enabled and not _is_boss_encounter_locked():
 		return
 	var max_hp_total: int = PLAYER_MAX_HP + _extra_player_max_hp()
@@ -6513,19 +7705,32 @@ func _draw_hit_effects() -> void:
 		var hit_progress: float = 1.0 - hit_alpha
 		var pop_in: float = minf(hit_progress * 5.0, 1.0)
 		var hit_scale: float = 0.62 + (1.0 - pow(1.0 - pop_in, 3.0)) * 0.38 + sin(pop_in * PI) * (0.34 if is_damage_number else 0.22)
-		var font_size: int = 27 if is_damage_number else 18
-		draw_set_transform(effect_position, -0.035 + hit_progress * 0.035, Vector2.ONE * hit_scale)
+		var font_size: int = 18
+		var hit_rotation: float = -0.035 + hit_progress * 0.035
+		var effect_text: String = String(effect["text"])
+		if is_damage_number:
+			# Player pick: chunky tilted numbers; big hits slam in larger and red.
+			var is_crit: bool = absi(effect_text.to_int()) >= DAMAGE_CRIT_THRESHOLD
+			var slam: float = clampf(hit_progress / 0.12, 0.0, 1.0)
+			hit_scale = lerpf(2.2 if is_crit else 1.7, 1.0, 1.0 - pow(1.0 - slam, 3.0))
+			hit_rotation = -0.14
+			font_size = 40 if is_crit else 30
+			if is_crit:
+				effect_color = Color(1.0, 0.36, 0.28)
+				if not effect_text.ends_with("!"):
+					effect_text += "!"
+		draw_set_transform(effect_position, hit_rotation, Vector2.ONE * hit_scale)
 		var shadow_offsets: Array[Vector2] = []
 		if is_damage_number:
-			shadow_offsets.assign([Vector2(-2, 0), Vector2(2, 0), Vector2(0, -2), Vector2(0, 2)])
+			shadow_offsets.assign([Vector2(-3, 0), Vector2(3, 0), Vector2(0, -3), Vector2(0, 3), Vector2(2, 4), Vector2(-2, 4)])
 		else:
 			shadow_offsets.append(Vector2(2, 2))
 		for shadow_offset in shadow_offsets:
-			draw_string(ThemeDB.fallback_font, shadow_offset, String(effect["text"]), HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, Color(0.02, 0.02, 0.03, hit_alpha * 0.90))
+			draw_string(ThemeDB.fallback_font, shadow_offset, effect_text, HORIZONTAL_ALIGNMENT_LEFT, -1, font_size, Color(0.02, 0.02, 0.03, hit_alpha * 0.90))
 		draw_string(
 			ThemeDB.fallback_font,
 			Vector2.ZERO,
-			String(effect["text"]),
+			effect_text,
 			HORIZONTAL_ALIGNMENT_LEFT,
 			-1,
 			font_size,
@@ -6923,13 +8128,14 @@ func _connect_ui_audio_feedback(node: Node) -> void:
 func _on_button_hovered(button: BaseButton, hovered: bool) -> void:
 	if button == null or not is_instance_valid(button) or button.disabled:
 		return
-	_animate_button_to(button, Vector2(1.035, 1.035) if hovered else Vector2.ONE, -0.008 if hovered else 0.0, 0.09 if hovered else 0.12)
+	# Player pick: tilt and grow on hover, squish on press.
+	_animate_button_to(button, Vector2(1.07, 1.07) if hovered else Vector2.ONE, -0.045 if hovered else 0.0, UI_ANIM_TIME * 0.5 if hovered else UI_ANIM_TIME * 0.4)
 	if hovered:
-		_play_sfx(ui_hover_sound, -30.0, randf_range(0.98, 1.04))
+		_play_sfx(ui_hover_sound, -30.0, _simulation_randf_range(0.98, 1.04))
 
 
 func _on_button_pressed_visual(button: BaseButton) -> void:
-	_animate_button_to(button, Vector2(0.965, 0.94), 0.006, 0.055)
+	_animate_button_to(button, Vector2(1.1, 0.82), 0.0, 0.06)
 
 
 func _on_button_released_visual(button: BaseButton) -> void:
@@ -6939,10 +8145,10 @@ func _on_button_released_visual(button: BaseButton) -> void:
 			old_tween.kill()
 	var settle_tween := create_tween()
 	settle_tween.set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-	settle_tween.tween_property(button, "scale", Vector2(1.045, 1.045), 0.07)
-	settle_tween.parallel().tween_property(button, "rotation", -0.006, 0.07)
-	settle_tween.tween_property(button, "scale", Vector2.ONE, 0.13)
-	settle_tween.parallel().tween_property(button, "rotation", 0.0, 0.13)
+	# Springs tall, then settles exactly to its accessible size (release smoke contract).
+	settle_tween.tween_property(button, "scale", Vector2(0.95, 1.1), 0.07)
+	settle_tween.tween_property(button, "scale", Vector2.ONE, 0.14)
+	settle_tween.parallel().tween_property(button, "rotation", 0.0, 0.14)
 	button.set_meta("polish_tween", settle_tween)
 
 
@@ -6952,14 +8158,14 @@ func _animate_button_to(button: BaseButton, target_scale: Vector2, target_rotati
 		if old_tween != null and old_tween.is_valid():
 			old_tween.kill()
 	var tween := create_tween()
-	tween.set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
+	tween.set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 	tween.tween_property(button, "scale", target_scale, duration)
 	tween.parallel().tween_property(button, "rotation", target_rotation, duration)
 	button.set_meta("polish_tween", tween)
 
 
 func _play_ui_click() -> void:
-	_play_sfx(ui_click_sound, -18.0, randf_range(0.97, 1.03))
+	_play_sfx(ui_click_sound, -18.0, _simulation_randf_range(0.97, 1.03))
 
 
 func _play_sfx(stream: AudioStream, volume_db: float = -8.0, pitch_scale: float = 1.0) -> void:
@@ -7201,6 +8407,9 @@ func _apply_audio_settings() -> void:
 		inventory_music_volume_slider.set_value_no_signal(music_volume_percent)
 	if inventory_sfx_volume_slider != null:
 		inventory_sfx_volume_slider.set_value_no_signal(sfx_volume_percent)
+	var ad_service := get_node_or_null("/root/AdService")
+	if ad_service != null:
+		ad_service.call("set_volume_percent", music_volume_percent)
 
 
 func _on_music_volume_changed(value: float) -> void:
@@ -7291,30 +8500,6 @@ func _draw_selection() -> void:
 		_draw_world_rect(Rect2(_cell_to_world(selected_cell) + Vector2(14, 14), Vector2(20, 20)), Color(1, 1, 1, 0.16))
 
 
-func _draw_ground_area(world_rect: Rect2, fallback_color: Color) -> void:
-	if grass_tile_texture == null:
-		_draw_world_rect(world_rect, fallback_color)
-		return
-	var tile_step := GROUND_TILE_DRAW_SIZE
-	var world_end := world_rect.position + world_rect.size
-	var y := world_rect.position.y
-	while y < world_end.y:
-		var x := world_rect.position.x
-		while x < world_end.x:
-			var draw_size := Vector2(
-				minf(tile_step.x, world_end.x - x),
-				minf(tile_step.y, world_end.y - y)
-			)
-			draw_texture_rect(
-				grass_tile_texture,
-				Rect2(Vector2(x, y) - camera_position, draw_size),
-				false
-			)
-			x += tile_step.x
-		y += tile_step.y
-	draw_rect(Rect2(world_rect.position - camera_position, world_rect.size), Color(fallback_color.r, fallback_color.g, fallback_color.b, 0.18), true)
-
-
 func _draw_wall_repair_marker(structure: Dictionary, cell: Vector2i) -> void:
 	var structure_type := int(structure.get("type", StructureType.NONE))
 	var max_hp := _wall_max_hp(structure_type)
@@ -7398,24 +8583,39 @@ func _draw_wall_visual(world_rect: Rect2, color: Color, hp: int, max_hp: int) ->
 func _draw_countdown_display() -> void:
 	if phase != Phase.BUILD or build_menu_open or dealer_menu_open or inventory_menu_open or escape_confirm_open or inside_house or inside_cave:
 		return
-	var panel_rect := Rect2(Vector2(432, 12), Vector2(416, 68))
-	_draw_ui_card(panel_rect, UI_WARM_ACCENT, UI_PANEL_FILL, 2.0)
-	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(18, 24), "BUILD PHASE", HORIZONTAL_ALIGNMENT_LEFT, -1, 16, MUTED_TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(18, 50), "Press Enter to start early", HORIZONTAL_ALIGNMENT_LEFT, -1, 16, TEXT_COLOR)
+	# Player pick: a shrinking ring around the team's pixel digits.
+	var ring_center := Vector2(SCREEN_SIZE.x * 0.5, 66.0)
+	var ring_radius: float = 50.0
+	var remaining_ratio: float = clampf(countdown / BUILD_PHASE_DURATION, 0.0, 1.0)
+	var urgent: bool = countdown <= 10.0
+	var ring_color: Color = UI_DANGER_ACCENT if urgent else UI_WARM_ACCENT
+	var second_fraction: float = countdown - floor(countdown)
+	var tick_bump: float = 1.0 + (0.08 if urgent else 0.04) * clampf((second_fraction - 0.85) / 0.15, 0.0, 1.0)
+	draw_circle(ring_center + Vector2(0, 4), ring_radius + 6.0, UI_PANEL_SHADOW)
+	draw_circle(ring_center, ring_radius + 6.0, UI_PANEL_FILL)
+	draw_arc(ring_center, ring_radius, 0.0, TAU, 64, Color(1, 1, 1, 0.12), 8.0, true)
+	if remaining_ratio > 0.0:
+		draw_arc(ring_center, ring_radius, -PI * 0.5, -PI * 0.5 + TAU * remaining_ratio, 64, ring_color, 8.0, true)
+	var hint_rect := Rect2(ring_center + Vector2(-70, ring_radius + 10.0), Vector2(140, 24))
+	draw_rect(hint_rect, UI_PANEL_FILL, true)
+	draw_string(ThemeDB.fallback_font, hint_rect.position + Vector2(0, 17), "%s  starts now" % _control_prompt("start_wave_early", "Enter"), HORIZONTAL_ALIGNMENT_CENTER, hint_rect.size.x, 14, TEXT_COLOR)
 	var countdown_text: String = "%02d" % int(ceili(countdown))
-	var digit_start := panel_rect.position + Vector2(290, 8)
+	var digit_size: Vector2 = COUNTDOWN_DIGIT_DRAW_SIZE * 0.72 * tick_bump
+	var digit_gap: float = 6.0
+	var digits_width: float = digit_size.x * countdown_text.length() + digit_gap * (countdown_text.length() - 1)
+	var digit_start := ring_center - Vector2(digits_width * 0.5, digit_size.y * 0.5)
 	for digit_index in range(countdown_text.length()):
 		var digit_char: String = countdown_text.substr(digit_index, 1)
 		var digit_value: int = int(digit_char)
-		var digit_draw_rect: Rect2 = Rect2(digit_start + Vector2(digit_index * (COUNTDOWN_DIGIT_DRAW_SIZE.x + 10.0), 4), COUNTDOWN_DIGIT_DRAW_SIZE)
+		var digit_draw_rect: Rect2 = Rect2(digit_start + Vector2(digit_index * (digit_size.x + digit_gap), 0), digit_size)
 		if countdown_numbers_texture != null and digit_value >= 0 and digit_value < COUNTDOWN_DIGIT_SOURCE_RECTS.size():
-			var digit_tile_rect: Rect2 = digit_draw_rect.grow(3.0)
+			var digit_tile_rect: Rect2 = digit_draw_rect.grow(2.0)
 			draw_rect(digit_tile_rect, Color(0.98, 0.88, 0.58, 0.96), true)
-			draw_rect(digit_tile_rect, UI_WARM_ACCENT, false, 2.0)
+			draw_rect(digit_tile_rect, ring_color, false, 2.0)
 			var source_rect: Rect2 = COUNTDOWN_DIGIT_SOURCE_RECTS[digit_value]
 			draw_texture_rect_region(countdown_numbers_texture, digit_draw_rect, source_rect)
 		else:
-			draw_string(ThemeDB.fallback_font, digit_draw_rect.position + Vector2(6, 40), digit_char, HORIZONTAL_ALIGNMENT_LEFT, -1, 38, Color(1.0, 0.93, 0.52))
+			draw_string(ThemeDB.fallback_font, digit_draw_rect.position + Vector2(2, digit_size.y * 0.85), digit_char, HORIZONTAL_ALIGNMENT_LEFT, -1, int(digit_size.y), Color(1.0, 0.93, 0.52))
 
 
 func _draw_tutorial_panel() -> void:
@@ -7450,7 +8650,7 @@ func _draw_tutorial_panel() -> void:
 		objective = "Ready for the audit"
 		detail = "%s starts the IRS wave" % _control_prompt("start_wave_early", "ENTER")
 	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(14, 25), "NEXT", HORIZONTAL_ALIGNMENT_LEFT, 46, 13, UI_COOL_ACCENT)
-	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(64, 27), objective, HORIZONTAL_ALIGNMENT_LEFT, 212, 18, TEXT_COLOR)
+	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(64, 27), objective, HORIZONTAL_ALIGNMENT_LEFT, 224, 17 if ThemeDB.fallback_font.get_string_size(objective, HORIZONTAL_ALIGNMENT_LEFT, -1, 18).x <= 224.0 else 15, TEXT_COLOR)
 	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(14, 58), detail, HORIZONTAL_ALIGNMENT_LEFT, 272, 14, UI_WARM_ACCENT)
 	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(294, 22), "T×", HORIZONTAL_ALIGNMENT_LEFT, 26, 12, MUTED_TEXT_COLOR)
 
@@ -7698,7 +8898,7 @@ func _draw_cave_interior() -> void:
 		var cave_anim_offset: float = enemy_rect.position.x * 0.007 + enemy_rect.position.y * 0.003
 		var cave_stride_phase: float = (world_time + cave_anim_offset) * (5.2 if is_boss else 8.4)
 		var cave_stride: float = sin(cave_stride_phase)
-		var cave_bob: float = absf(sin(cave_stride_phase)) * (2.0 if is_boss else 2.8)
+		var cave_bob: float = absf(sin(cave_stride_phase)) * (2.0 if is_boss else 4.0)
 		var attack_time: float = float(cave_enemy.get("attack_timer", 0.0))
 		var attack_punch: float = sin(clampf(1.0 - attack_time / (CAVE_BOSS_ATTACK_TIME if is_boss else 0.24), 0.0, 1.0) * PI) if attack_time > 0.0 else 0.0
 		var miner_texture: Texture2D = _boss_display_texture(cave_enemy) if is_boss else _current_cave_miner_texture(cave_anim_offset)
@@ -7714,7 +8914,7 @@ func _draw_cave_interior() -> void:
 				draw_circle(Vector2.ZERO, 22.0, CAVE_BOSS_SHADOW_COLOR)
 				draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 			var side_scale: float = -1.0 if miner_facing_left else 1.0
-			var miner_scale := Vector2(side_scale * (1.0 + cave_stride * 0.028 + attack_punch * 0.10), 1.0 - cave_stride * 0.022 - attack_punch * 0.055)
+			var miner_scale := Vector2(side_scale * (1.0 + cave_stride * (0.028 if is_boss else 0.045) + attack_punch * 0.10), 1.0 - cave_stride * (0.022 if is_boss else 0.035) - attack_punch * 0.055)
 			var miner_rotation: float = (-0.025 if miner_facing_left else 0.025) * cave_stride + (-0.08 if miner_facing_left else 0.08) * attack_punch
 			draw_set_transform(miner_draw_rect.position + miner_draw_rect.size * 0.5, miner_rotation, miner_scale)
 			draw_texture_rect(miner_texture, Rect2(-miner_draw_rect.size * 0.5, miner_draw_rect.size), false)
@@ -7726,6 +8926,9 @@ func _draw_cave_interior() -> void:
 			draw_rect(enemy_rect, Color(0.10, 0.04, 0.04, 0.55), false, 2.0)
 		if not is_boss:
 			_draw_cave_miner_shovel(enemy_rect, miner_facing_left, float(cave_enemy.get("attack_timer", 0.0)))
+			if dev_mode_enabled:
+				draw_line(enemy_rect.get_center(), enemy_rect.get_center() + Vector2(cave_enemy.get("ai_direction", Vector2.ZERO)) * 48.0, Color(0.45, 0.9, 1.0, 0.75), 2.0)
+				draw_string(ThemeDB.fallback_font, enemy_rect.position + Vector2(-18, -20), String(cave_enemy.get("ai_thought", "Pursue Bob")), HORIZONTAL_ALIGNMENT_LEFT, 180, 11, Color(0.75, 0.95, 1.0))
 		else:
 			var slam_active: bool = float(cave_enemy.get("slam_timer", 0.0)) > 0.0
 			var stunned: bool = float(cave_enemy.get("stun_timer", 0.0)) > 0.0
@@ -8368,11 +9571,11 @@ func _draw_build_menu() -> void:
 	if not build_menu_open or phase != Phase.BUILD or inside_house or inside_cave:
 		return
 	var panel_rect: Rect2 = _build_menu_panel_rect()
-	var hovered_weapon: String = _build_menu_weapon_at_position(get_viewport().get_mouse_position())
+	var hovered_weapon: String = _build_menu_weapon_at_position(_replay_get_mouse_position())
 	_draw_ui_card(panel_rect, UI_COOL_ACCENT, UI_PANEL_FILL, 2.0)
-	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(22, 28), "Build Defenses", HORIZONTAL_ALIGNMENT_LEFT, -1, 24, TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(22, 52), "Stand on an outlined yard tile, then choose what to build here.", HORIZONTAL_ALIGNMENT_LEFT, 670, 16, MUTED_TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(880, 32), "BUILD TIME  %02ds" % int(ceili(countdown)), HORIZONTAL_ALIGNMENT_RIGHT, 200, 18, UI_WARM_ACCENT)
+	_pstr(ThemeDB.fallback_font, panel_rect.position + Vector2(22, 28), "Build Defenses", HORIZONTAL_ALIGNMENT_LEFT, -1, 24, TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, panel_rect.position + Vector2(22, 52), "Stand on an outlined yard tile, then choose what to build here.", HORIZONTAL_ALIGNMENT_LEFT, 670, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, panel_rect.position + Vector2(880, 32), "BUILD TIME  %02ds" % int(ceili(countdown)), HORIZONTAL_ALIGNMENT_RIGHT, 200, 18, UI_WARM_ACCENT)
 	_draw_build_menu_tab(panel_rect, "sentries", "Sentries")
 	_draw_build_menu_tab(panel_rect, "walls", "Walls")
 	var sentry_kinds: Array[String] = _build_menu_items()
@@ -8383,7 +9586,7 @@ func _draw_build_menu() -> void:
 	var preview_weapon: String = hovered_weapon if hovered_weapon != "" else selected_sentry_kind
 	if preview_weapon != "":
 		_draw_sentry_hover_preview(Rect2(panel_rect.position + Vector2(746, 82), Vector2(356, 424)), preview_weapon)
-	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(24, 522), "Tab switches category  |  Arrows preview  |  Click or Space builds  |  B / Esc closes", HORIZONTAL_ALIGNMENT_LEFT, 850, 14, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, panel_rect.position + Vector2(24, 522), "Tab switches category  |  Arrows preview  |  Click or Space builds  |  B / Esc closes", HORIZONTAL_ALIGNMENT_LEFT, 850, 14, MUTED_TEXT_COLOR)
 
 
 func _draw_build_menu_tab(panel_rect: Rect2, tab_name: String, tab_label: String) -> void:
@@ -8392,10 +9595,12 @@ func _draw_build_menu_tab(panel_rect: Rect2, tab_name: String, tab_label: String
 	var accent: Color = UI_COOL_ACCENT if tab_name == "sentries" else Color(0.86, 0.70, 0.42)
 	var fill: Color = Color(0.16, 0.22, 0.26, 0.98) if is_active else Color(0.10, 0.12, 0.15, 0.94)
 	_draw_ui_card(tab_rect, accent if is_active else Color(1, 1, 1, 0.16), fill, 2.0, Vector2.ZERO)
-	draw_string(ThemeDB.fallback_font, tab_rect.position + Vector2(20, 27), tab_label, HORIZONTAL_ALIGNMENT_CENTER, tab_rect.size.x - 40.0, 18, TEXT_COLOR if is_active else MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, tab_rect.position + Vector2(20, 27), tab_label, HORIZONTAL_ALIGNMENT_CENTER, tab_rect.size.x - 40.0, 18, TEXT_COLOR if is_active else MUTED_TEXT_COLOR)
 
 
 func _draw_sentry_option(option_rect: Rect2, weapon: String, title: String, price_text: String, is_selected: bool, is_hovered: bool) -> void:
+	if is_hovered:
+		option_rect.position.y -= 4.0
 	var fill_color: Color = Color(0.16, 0.19, 0.22, 0.96) if is_selected else Color(0.11, 0.13, 0.16, 0.92)
 	if is_hovered:
 		fill_color = fill_color.lightened(0.08)
@@ -8413,21 +9618,21 @@ func _draw_sentry_option(option_rect: Rect2, weapon: String, title: String, pric
 	elif weapon == "magic":
 		accent_color = MAGIC_COLOR
 	_draw_ui_card(option_rect, accent_color if (is_selected or is_hovered) else Color(1, 1, 1, 0.16), fill_color, 2.0, Vector2(0, 4))
-	draw_string(ThemeDB.fallback_font, option_rect.position + Vector2(14, 22), title, HORIZONTAL_ALIGNMENT_LEFT, option_rect.size.x - 78.0, 17, TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, option_rect.position + Vector2(14, 42), price_text, HORIZONTAL_ALIGNMENT_LEFT, option_rect.size.x - 78.0, 14, MUTED_TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, option_rect.position + Vector2(14, 60), String(_sentry_summary_lines(weapon)[0]), HORIZONTAL_ALIGNMENT_LEFT, option_rect.size.x - 78.0, 13, accent_color)
+	_pstr(ThemeDB.fallback_font, option_rect.position + Vector2(14, 22), title, HORIZONTAL_ALIGNMENT_LEFT, option_rect.size.x - 78.0, 17, TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, option_rect.position + Vector2(14, 42), price_text, HORIZONTAL_ALIGNMENT_LEFT, option_rect.size.x - 66.0, 14 if ThemeDB.fallback_font.get_string_size(price_text, HORIZONTAL_ALIGNMENT_LEFT, -1, 14).x <= option_rect.size.x - 66.0 else 12, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, option_rect.position + Vector2(14, 60), String(_sentry_summary_lines(weapon)[0]), HORIZONTAL_ALIGNMENT_LEFT, option_rect.size.x - 78.0, 13, accent_color)
 	var icon_center: Vector2 = option_rect.position + Vector2(option_rect.size.x - 34, option_rect.size.y * 0.5)
 	draw_circle(icon_center, 13.0, accent_color)
 	if weapon == "wall_light" or weapon == "wall_medium" or weapon == "wall_heavy":
 		var wall_width: float = 22.0
 		var wall_height: float = 14.0 if weapon == "wall_light" else (18.0 if weapon == "wall_medium" else 22.0)
-		draw_rect(Rect2(icon_center - Vector2(wall_width * 0.5, wall_height * 0.5), Vector2(wall_width, wall_height)), accent_color, true)
-		draw_rect(Rect2(icon_center - Vector2(wall_width * 0.5, wall_height * 0.5), Vector2(wall_width, wall_height)), Color(0.12, 0.10, 0.08), false, 2.0)
+		_prect(Rect2(icon_center - Vector2(wall_width * 0.5, wall_height * 0.5), Vector2(wall_width, wall_height)), accent_color, true)
+		_prect(Rect2(icon_center - Vector2(wall_width * 0.5, wall_height * 0.5), Vector2(wall_width, wall_height)), Color(0.12, 0.10, 0.08), false, 2.0)
 	elif weapon == "cannon":
 		draw_circle(icon_center, 5.0, Color(0.16, 0.14, 0.12))
 	elif weapon == "gun":
-		draw_line(icon_center - Vector2(10, 0), icon_center + Vector2(12, 0), Color(0.16, 0.14, 0.12), 3.0)
-		draw_rect(Rect2(icon_center + Vector2(-4, -5), Vector2(10, 10)), accent_color, true)
+		_pline(icon_center - Vector2(10, 0), icon_center + Vector2(12, 0), Color(0.16, 0.14, 0.12), 3.0)
+		_prect(Rect2(icon_center + Vector2(-4, -5), Vector2(10, 10)), accent_color, true)
 	elif weapon == "magic":
 		draw_colored_polygon(PackedVector2Array([
 			icon_center + Vector2(0, -12),
@@ -8436,9 +9641,9 @@ func _draw_sentry_option(option_rect: Rect2, weapon: String, title: String, pric
 			icon_center + Vector2(-10, 0)
 		]), MAGIC_COLOR)
 	else:
-		draw_line(icon_center - Vector2(12, 0), icon_center + Vector2(12, 0), Color(0.18, 0.12, 0.06), 3.0)
-		draw_line(icon_center + Vector2(4, -7), icon_center + Vector2(12, 0), Color(0.18, 0.12, 0.06), 3.0)
-		draw_line(icon_center + Vector2(4, 7), icon_center + Vector2(12, 0), Color(0.18, 0.12, 0.06), 3.0)
+		_pline(icon_center - Vector2(12, 0), icon_center + Vector2(12, 0), Color(0.18, 0.12, 0.06), 3.0)
+		_pline(icon_center + Vector2(4, -7), icon_center + Vector2(12, 0), Color(0.18, 0.12, 0.06), 3.0)
+		_pline(icon_center + Vector2(4, 7), icon_center + Vector2(12, 0), Color(0.18, 0.12, 0.06), 3.0)
 
 
 func _build_menu_panel_rect() -> Rect2:
@@ -8481,9 +9686,9 @@ func _build_menu_weapon_at_position(mouse_position: Vector2) -> String:
 
 func _draw_sentry_hover_preview(preview_rect: Rect2, weapon: String) -> void:
 	_draw_ui_card(preview_rect, UI_COOL_ACCENT, UI_PANEL_FILL_SOFT, 2.0, Vector2(0, 4))
-	draw_string(ThemeDB.fallback_font, preview_rect.position + Vector2(18, 30), "BUILD PREVIEW", HORIZONTAL_ALIGNMENT_LEFT, 180, 14, MUTED_TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, preview_rect.position + Vector2(18, 60), _sentry_label(weapon), HORIZONTAL_ALIGNMENT_LEFT, 210, 24, TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, preview_rect.position + Vector2(18, 84), _sentry_price_label(weapon), HORIZONTAL_ALIGNMENT_LEFT, 270, 15, UI_WARM_ACCENT)
+	_pstr(ThemeDB.fallback_font, preview_rect.position + Vector2(18, 30), "BUILD PREVIEW", HORIZONTAL_ALIGNMENT_LEFT, 180, 14, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, preview_rect.position + Vector2(18, 60), _sentry_label(weapon), HORIZONTAL_ALIGNMENT_LEFT, 210, 24, TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, preview_rect.position + Vector2(18, 84), _sentry_price_label(weapon), HORIZONTAL_ALIGNMENT_LEFT, 270, 15, UI_WARM_ACCENT)
 	var stage_rect := Rect2(preview_rect.position + Vector2(18, 102), Vector2(preview_rect.size.x - 36, 150))
 	_draw_ui_card(stage_rect, Color(1, 1, 1, 0.12), Color(0.06, 0.08, 0.10, 0.96), 1.0, Vector2.ZERO)
 	draw_circle(stage_rect.position + Vector2(stage_rect.size.x * 0.5, 118), 72.0, Color(0.24, 0.32, 0.22, 0.34))
@@ -8491,7 +9696,7 @@ func _draw_sentry_hover_preview(preview_rect: Rect2, weapon: String) -> void:
 	_draw_sentry_preview_sprite(preview_center, weapon)
 	var summary_lines: PackedStringArray = _sentry_summary_lines(weapon)
 	for summary_index in range(summary_lines.size()):
-		draw_string(
+		_pstr(
 			ThemeDB.fallback_font,
 			preview_rect.position + Vector2(20, 284 + summary_index * 26),
 			summary_lines[summary_index],
@@ -8500,7 +9705,7 @@ func _draw_sentry_hover_preview(preview_rect: Rect2, weapon: String) -> void:
 			16,
 			MUTED_TEXT_COLOR if summary_index < summary_lines.size() - 1 else Color(0.92, 0.84, 0.48)
 		)
-	draw_string(ThemeDB.fallback_font, preview_rect.position + Vector2(20, 402), "Click its card to build on the selected tile.", HORIZONTAL_ALIGNMENT_LEFT, preview_rect.size.x - 40.0, 14, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, preview_rect.position + Vector2(20, 402), "Click its card to build on the selected tile.", HORIZONTAL_ALIGNMENT_LEFT, preview_rect.size.x - 40.0, 14, MUTED_TEXT_COLOR)
 
 
 func _draw_sentry_preview_sprite(preview_center: Vector2, weapon: String) -> void:
@@ -8514,7 +9719,7 @@ func _draw_sentry_preview_sprite(preview_center: Vector2, weapon: String) -> voi
 			draw_texture_rect(wall_texture, Rect2(preview_center - Vector2(70, 58), Vector2(140, 116)), false)
 		else:
 			var wall_color: Color = LIGHT_WALL_COLOR if weapon == "wall_light" else (MEDIUM_WALL_COLOR if weapon == "wall_medium" else HEAVY_WALL_COLOR)
-			draw_rect(Rect2(preview_center - Vector2(64, 38), Vector2(128, 76)), wall_color, true)
+			_prect(Rect2(preview_center - Vector2(64, 38), Vector2(128, 76)), wall_color, true)
 		return
 	if weapon == "cannon" and cannon_turret_texture != null:
 		var cannon_preview_size: Vector2 = CANNON_TURRET_DRAW_SIZE * 1.45
@@ -8586,20 +9791,20 @@ func _update_dealer_controller_input() -> void:
 		dealer_selected_index = 0
 		return
 	dealer_selected_index = clampi(dealer_selected_index, 0, items.size() - 1)
-	if Input.is_action_just_pressed("build_arrow_turret"):
+	if _replay_action_just_pressed("build_arrow_turret"):
 		dealer_page = "sell" if dealer_page == "buy" else "buy"
 		dealer_selected_index = 0
 		_play_sfx(ui_click_sound, -17.0, 1.04)
 		return
-	if Input.is_action_just_pressed("move_left"):
+	if _replay_action_just_pressed("move_left"):
 		dealer_selected_index = posmod(dealer_selected_index - 1, items.size())
-	elif Input.is_action_just_pressed("move_right"):
+	elif _replay_action_just_pressed("move_right"):
 		dealer_selected_index = posmod(dealer_selected_index + 1, items.size())
-	elif Input.is_action_just_pressed("move_up"):
+	elif _replay_action_just_pressed("move_up"):
 		dealer_selected_index = posmod(dealer_selected_index - 2, items.size())
-	elif Input.is_action_just_pressed("move_down"):
+	elif _replay_action_just_pressed("move_down"):
 		dealer_selected_index = posmod(dealer_selected_index + 2, items.size())
-	elif Input.is_action_just_pressed("action"):
+	elif _replay_action_just_pressed("action"):
 		_purchase_dealer_item(String(items[dealer_selected_index]["id"]))
 
 
@@ -8701,6 +9906,18 @@ func _dealer_sell_gold_gain(item_id: String) -> int:
 
 
 func _purchase_dealer_item(item_id: String) -> void:
+	var wallet_before := [gold, wood, stone, iron, gunpowder, player_hp, energy_drink_timer]
+	_purchase_dealer_item_inner(item_id)
+	if wallet_before != [gold, wood, stone, iron, gunpowder, player_hp, energy_drink_timer]:
+		var items: Array[Dictionary] = _dealer_items(dealer_page)
+		for item_index in range(items.size()):
+			if String(items[item_index]["id"]) == item_id:
+				var item_rect: Rect2 = _dealer_item_rect(_dealer_panel_rect(), item_index)
+				_add_ui_stamp(item_rect.get_center() + Vector2(70, 0), "SOLD" if item_id.begins_with("sell_") else "PAID", false)
+				break
+
+
+func _purchase_dealer_item_inner(item_id: String) -> void:
 	_play_sfx(ui_click_sound, -18.0, 0.96)
 	var item_price: int = 0
 	for item in _dealer_items(dealer_page):
@@ -8808,22 +10025,22 @@ func _draw_dealer_menu() -> void:
 	var panel_rect: Rect2 = _dealer_panel_rect()
 	var buy_tab_rect: Rect2 = _dealer_page_rect(panel_rect, "buy")
 	var sell_tab_rect: Rect2 = _dealer_page_rect(panel_rect, "sell")
-	var hovered_id: String = _dealer_item_at_position(get_viewport().get_mouse_position())
+	var hovered_id: String = _dealer_item_at_position(_replay_get_mouse_position())
 	var ammo_totals: Dictionary = _turret_ammo_totals()
 	_draw_ui_card(panel_rect, UI_WARM_ACCENT, UI_PANEL_FILL, 3.0, Vector2(0, 10))
-	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(28, 36), "BOB'S TOTALLY LEGAL ARMS DEALER", HORIZONTAL_ALIGNMENT_LEFT, 520, 25, TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, panel_rect.position + Vector2(28, 36), "BOB'S TOTALLY LEGAL ARMS DEALER", HORIZONTAL_ALIGNMENT_LEFT, 520, 25, TEXT_COLOR)
 	var dealer_wallet_text := "Wallet  %d$  •  Ammo %d/%d  •  Shells %d/%d" % [gold, int(ammo_totals["ammo"]), int(ammo_totals["ammo_max"]), int(ammo_totals["shells"]), int(ammo_totals["shells_max"])]
 	if dealer_page == "sell":
 		dealer_wallet_text = "Sell stock  •  Wood %d  Stone %d  Iron %d  Powder %d  •  Wallet %d$" % [wood, stone, iron, gunpowder, gold]
-	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(28, 61), dealer_wallet_text, HORIZONTAL_ALIGNMENT_LEFT, 660, 16, MUTED_TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(648, 39), "BUILD TIME  %02ds" % int(ceili(countdown)), HORIZONTAL_ALIGNMENT_RIGHT, 176, 17, UI_WARM_ACCENT)
+	_pstr(ThemeDB.fallback_font, panel_rect.position + Vector2(28, 61), dealer_wallet_text, HORIZONTAL_ALIGNMENT_LEFT, 660, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, panel_rect.position + Vector2(648, 39), "BUILD TIME  %02ds" % int(ceili(countdown)), HORIZONTAL_ALIGNMENT_RIGHT, 176, 17, UI_WARM_ACCENT)
 	if arms_dealer_texture != null:
 		draw_texture_rect(arms_dealer_texture, Rect2(panel_rect.position + Vector2(850, 8), Vector2(58, 104)), false)
 	_draw_ui_card(buy_tab_rect, UI_WARM_ACCENT if dealer_page == "buy" else Color(1, 1, 1, 0.14), Color(0.18, 0.21, 0.24, 0.98) if dealer_page != "buy" else Color(0.22, 0.26, 0.16, 0.98), 2.0, Vector2.ZERO)
 	_draw_ui_card(sell_tab_rect, UI_WARM_ACCENT if dealer_page == "sell" else Color(1, 1, 1, 0.14), Color(0.18, 0.21, 0.24, 0.98) if dealer_page != "sell" else Color(0.24, 0.18, 0.14, 0.98), 2.0, Vector2.ZERO)
-	draw_string(ThemeDB.fallback_font, buy_tab_rect.position + Vector2(35, 22), "Buy", HORIZONTAL_ALIGNMENT_LEFT, 52, 18, TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, sell_tab_rect.position + Vector2(34, 22), "Sell", HORIZONTAL_ALIGNMENT_LEFT, 54, 18, TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(304, 94), "Gear in. Spare materials out. Receipts absolutely unavailable.", HORIZONTAL_ALIGNMENT_LEFT, 500, 14, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, buy_tab_rect.position + Vector2(35, 22), "Buy", HORIZONTAL_ALIGNMENT_LEFT, 52, 18, TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, sell_tab_rect.position + Vector2(34, 22), "Sell", HORIZONTAL_ALIGNMENT_LEFT, 54, 18, TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, panel_rect.position + Vector2(304, 94), "Gear in. Spare materials out. Receipts absolutely unavailable.", HORIZONTAL_ALIGNMENT_LEFT, 500, 14, MUTED_TEXT_COLOR)
 	var items: Array[Dictionary] = _dealer_items(dealer_page)
 	dealer_selected_index = clampi(dealer_selected_index, 0, maxi(items.size() - 1, 0))
 	var active_item_id: String = hovered_id
@@ -8835,6 +10052,8 @@ func _draw_dealer_menu() -> void:
 		var owned: bool = _dealer_item_owned(String(item["id"]))
 		var can_activate: bool = _dealer_item_can_activate(item)
 		var hovered: bool = active_item_id == String(item["id"])
+		if hovered:
+			item_rect.position.y -= 4.0
 		var fill_color: Color = Color(0.13, 0.16, 0.19, 0.96) if can_activate else Color(0.09, 0.10, 0.11, 0.94)
 		if owned:
 			fill_color = Color(0.18, 0.24, 0.18, 0.96)
@@ -8847,16 +10066,16 @@ func _draw_dealer_menu() -> void:
 			draw_texture_rect(energy_drink_texture, Rect2(item_rect.position + Vector2(10, 6), Vector2(30, 44)), false)
 			item_text_x = 48.0
 		var item_text_color := TEXT_COLOR if can_activate or owned else MUTED_TEXT_COLOR.darkened(0.18)
-		draw_string(ThemeDB.fallback_font, item_rect.position + Vector2(item_text_x, 21), String(item["title"]), HORIZONTAL_ALIGNMENT_LEFT, 252.0 - item_text_x + 14.0, 17, item_text_color)
-		draw_string(ThemeDB.fallback_font, item_rect.position + Vector2(item_text_x, 43), String(item["desc"]), HORIZONTAL_ALIGNMENT_LEFT, 306.0 - item_text_x + 14.0, 13, MUTED_TEXT_COLOR)
+		_pstr(ThemeDB.fallback_font, item_rect.position + Vector2(item_text_x, 21), String(item["title"]), HORIZONTAL_ALIGNMENT_LEFT, 252.0 - item_text_x + 14.0, 17, item_text_color)
+		_pstr(ThemeDB.fallback_font, item_rect.position + Vector2(item_text_x, 43), String(item["desc"]), HORIZONTAL_ALIGNMENT_LEFT, 306.0 - item_text_x + 14.0, 13, MUTED_TEXT_COLOR)
 		var price_text: String = "Owned" if owned else ("%d dollars" % int(item["price"]))
 		if String(item["id"]).begins_with("sell_"):
 			price_text = "+%d$" % _dealer_sell_gold_gain(String(item["id"]))
-		draw_string(ThemeDB.fallback_font, item_rect.position + Vector2(item_rect.size.x - 104, 24), price_text, HORIZONTAL_ALIGNMENT_RIGHT, 88, 15, UI_SUCCESS_ACCENT if can_activate else MUTED_TEXT_COLOR)
+		_pstr(ThemeDB.fallback_font, item_rect.position + Vector2(item_rect.size.x - 104, 24), price_text, HORIZONTAL_ALIGNMENT_RIGHT, 88, 15, UI_SUCCESS_ACCENT if can_activate else MUTED_TEXT_COLOR)
 	if active_item_id != "":
 		_draw_dealer_hover_panel(Rect2(panel_rect.position + Vector2(24, 456), Vector2(884, 46)), active_item_id)
 	_draw_ui_card(Rect2(panel_rect.position + Vector2(24, 510), Vector2(884, 22)), Color(1, 1, 1, 0.08), Color(0.10, 0.12, 0.14, 1.0), 1.0, Vector2.ZERO)
-	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(36, 526), dealer_status_text + "  •  Y tab  •  A buy/sell  •  G/RB close", HORIZONTAL_ALIGNMENT_LEFT, 856, 14, TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, panel_rect.position + Vector2(36, 526), dealer_status_text + "  •  Y tab  •  A buy/sell  •  G/RB close", HORIZONTAL_ALIGNMENT_LEFT, 856, 14, TEXT_COLOR)
 
 
 func _draw_dealer_hover_panel(panel_rect: Rect2, item_id: String) -> void:
@@ -8906,8 +10125,8 @@ func _draw_dealer_hover_panel(panel_rect: Rect2, item_id: String) -> void:
 		"energy_drink":
 			title = "Energy Drink"
 			body = "A 20-second movement boost for fast gathering or emergencies."
-	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(14, 22), title, HORIZONTAL_ALIGNMENT_LEFT, panel_rect.size.x - 28.0, 18, TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(178, 22), body, HORIZONTAL_ALIGNMENT_LEFT, panel_rect.size.x - 194.0, 14, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, panel_rect.position + Vector2(14, 22), title, HORIZONTAL_ALIGNMENT_LEFT, panel_rect.size.x - 28.0, 18, TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, panel_rect.position + Vector2(178, 22), body, HORIZONTAL_ALIGNMENT_LEFT, panel_rect.size.x - 194.0, 14, MUTED_TEXT_COLOR)
 
 
 func _wrap_ui_text(text: String, max_characters: int) -> Array[String]:
@@ -8970,8 +10189,8 @@ func _draw_inventory_menu() -> void:
 		return
 	var panel_rect := Rect2(Vector2(318, 120), Vector2(644, 480))
 	_draw_ui_card(panel_rect, UI_SUCCESS_ACCENT, UI_PANEL_FILL, 3.0, Vector2(0, 10))
-	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(28, 38), "Inventory", HORIZONTAL_ALIGNMENT_LEFT, 220, 30, TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, panel_rect.position + Vector2(28, 64), "Press E or Esc to close", HORIZONTAL_ALIGNMENT_LEFT, 240, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, panel_rect.position + Vector2(28, 38), "Inventory", HORIZONTAL_ALIGNMENT_LEFT, 220, 30, TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, panel_rect.position + Vector2(28, 64), "Press E or Esc to close", HORIZONTAL_ALIGNMENT_LEFT, 240, 16, MUTED_TEXT_COLOR)
 	if inventory_icon_texture != null:
 		draw_texture_rect(inventory_icon_texture, Rect2(panel_rect.position + Vector2(548, 18), Vector2(58, 58)), false)
 
@@ -8986,35 +10205,35 @@ func _draw_inventory_menu() -> void:
 	_draw_ui_card(stats_rect, Color(1, 1, 1, 0.10), UI_PANEL_FILL_SOFT, 1.0)
 	if heart_icon_texture != null:
 		draw_texture_rect(heart_icon_texture, Rect2(stats_rect.position + Vector2(14, 8), Vector2(22, 22)), false)
-	draw_string(ThemeDB.fallback_font, stats_rect.position + Vector2(42, 24), "%d/%d" % [player_hp, hp_total], HORIZONTAL_ALIGNMENT_LEFT, 104, 18, TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, stats_rect.position + Vector2(168, 24), "Carry %d/%d" % [total_carried, carry_limit], HORIZONTAL_ALIGNMENT_LEFT, 144, 18, Color(1.0, 0.84, 0.52) if total_carried >= carry_limit else TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, stats_rect.position + Vector2(332, 24), "Round %d" % round_number, HORIZONTAL_ALIGNMENT_LEFT, 96, 18, TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, stats_rect.position + Vector2(444, 24), phase_text, HORIZONTAL_ALIGNMENT_LEFT, 94, 18, UI_COOL_ACCENT)
-	draw_string(ThemeDB.fallback_font, stats_rect.position + Vector2(16, 52), "House %d/%d" % [_house_integrity_left(), HOUSE_MAX_DAMAGE_STAGES], HORIZONTAL_ALIGNMENT_LEFT, 120, 16, MUTED_TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, stats_rect.position + Vector2(168, 52), "Ammo %d/%d" % [int(ammo_totals["ammo"]), int(ammo_totals["ammo_max"])], HORIZONTAL_ALIGNMENT_LEFT, 134, 16, MUTED_TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, stats_rect.position + Vector2(332, 52), "Shells %d/%d" % [int(ammo_totals["shells"]), int(ammo_totals["shells_max"])], HORIZONTAL_ALIGNMENT_LEFT, 132, 16, MUTED_TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, stats_rect.position + Vector2(474, 52), location_text, HORIZONTAL_ALIGNMENT_LEFT, 90, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, stats_rect.position + Vector2(42, 24), "%d/%d" % [player_hp, hp_total], HORIZONTAL_ALIGNMENT_LEFT, 104, 18, TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, stats_rect.position + Vector2(168, 24), "Carry %d/%d" % [total_carried, carry_limit], HORIZONTAL_ALIGNMENT_LEFT, 144, 18, Color(1.0, 0.84, 0.52) if total_carried >= carry_limit else TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, stats_rect.position + Vector2(332, 24), "Round %d" % round_number, HORIZONTAL_ALIGNMENT_LEFT, 96, 18, TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, stats_rect.position + Vector2(444, 24), phase_text, HORIZONTAL_ALIGNMENT_LEFT, 94, 18, UI_COOL_ACCENT)
+	_pstr(ThemeDB.fallback_font, stats_rect.position + Vector2(16, 52), "House %d/%d" % [_house_integrity_left(), HOUSE_MAX_DAMAGE_STAGES], HORIZONTAL_ALIGNMENT_LEFT, 120, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, stats_rect.position + Vector2(168, 52), "Ammo %d/%d" % [int(ammo_totals["ammo"]), int(ammo_totals["ammo_max"])], HORIZONTAL_ALIGNMENT_LEFT, 134, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, stats_rect.position + Vector2(332, 52), "Shells %d/%d" % [int(ammo_totals["shells"]), int(ammo_totals["shells_max"])], HORIZONTAL_ALIGNMENT_LEFT, 132, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, stats_rect.position + Vector2(474, 52), location_text, HORIZONTAL_ALIGNMENT_LEFT, 90, 16, MUTED_TEXT_COLOR)
 
 	var left_rect := Rect2(panel_rect.position + Vector2(26, 190), Vector2(272, 142))
 	var right_rect := Rect2(panel_rect.position + Vector2(346, 190), Vector2(272, 142))
 	_draw_ui_card(left_rect, Color(1, 1, 1, 0.10), UI_PANEL_FILL_SOFT, 1.0)
 	_draw_ui_card(right_rect, Color(1, 1, 1, 0.10), UI_PANEL_FILL_SOFT, 1.0)
-	draw_string(ThemeDB.fallback_font, left_rect.position + Vector2(16, 24), "Materials", HORIZONTAL_ALIGNMENT_LEFT, 180, 20, TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, left_rect.position + Vector2(16, 52), "Wood: %d" % wood, HORIZONTAL_ALIGNMENT_LEFT, 100, 16, MUTED_TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, left_rect.position + Vector2(16, 78), "Stone: %d" % stone, HORIZONTAL_ALIGNMENT_LEFT, 100, 16, MUTED_TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, left_rect.position + Vector2(16, 104), "Iron: %d" % iron, HORIZONTAL_ALIGNMENT_LEFT, 100, 16, MUTED_TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, left_rect.position + Vector2(132, 52), "Powder: %d" % gunpowder, HORIZONTAL_ALIGNMENT_LEFT, 116, 16, MUTED_TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, left_rect.position + Vector2(132, 78), "Dollars: %d" % gold, HORIZONTAL_ALIGNMENT_LEFT, 116, 16, MUTED_TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, left_rect.position + Vector2(132, 104), "Crystals: %d" % cave_crystals_owned, HORIZONTAL_ALIGNMENT_LEFT, 116, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, left_rect.position + Vector2(16, 24), "Materials", HORIZONTAL_ALIGNMENT_LEFT, 180, 20, TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, left_rect.position + Vector2(16, 52), "Wood: %d" % wood, HORIZONTAL_ALIGNMENT_LEFT, 100, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, left_rect.position + Vector2(16, 78), "Stone: %d" % stone, HORIZONTAL_ALIGNMENT_LEFT, 100, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, left_rect.position + Vector2(16, 104), "Iron: %d" % iron, HORIZONTAL_ALIGNMENT_LEFT, 100, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, left_rect.position + Vector2(132, 52), "Powder: %d" % gunpowder, HORIZONTAL_ALIGNMENT_LEFT, 116, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, left_rect.position + Vector2(132, 78), "Dollars: %d" % gold, HORIZONTAL_ALIGNMENT_LEFT, 116, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, left_rect.position + Vector2(132, 104), "Crystals: %d" % cave_crystals_owned, HORIZONTAL_ALIGNMENT_LEFT, 116, 16, MUTED_TEXT_COLOR)
 
-	draw_string(ThemeDB.fallback_font, right_rect.position + Vector2(16, 24), "Run Status", HORIZONTAL_ALIGNMENT_LEFT, 180, 20, TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, right_rect.position + Vector2(16, 52), "Safe house items: %d" % house_items.size(), HORIZONTAL_ALIGNMENT_LEFT, 180, 16, MUTED_TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, right_rect.position + Vector2(16, 78), "Stolen by IRS: %d" % stolen_house_items.size(), HORIZONTAL_ALIGNMENT_LEFT, 180, 16, MUTED_TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, right_rect.position + Vector2(16, 104), "Selected build: %s" % _sentry_label(selected_sentry_kind), HORIZONTAL_ALIGNMENT_LEFT, 220, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, right_rect.position + Vector2(16, 24), "Run Status", HORIZONTAL_ALIGNMENT_LEFT, 180, 20, TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, right_rect.position + Vector2(16, 52), "Safe house items: %d" % house_items.size(), HORIZONTAL_ALIGNMENT_LEFT, 180, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, right_rect.position + Vector2(16, 78), "Stolen by IRS: %d" % stolen_house_items.size(), HORIZONTAL_ALIGNMENT_LEFT, 180, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, right_rect.position + Vector2(16, 104), "Selected build: %s" % _sentry_label(selected_sentry_kind), HORIZONTAL_ALIGNMENT_LEFT, 220, 16, MUTED_TEXT_COLOR)
 
 	var audio_rect := Rect2(panel_rect.position + Vector2(26, 344), Vector2(592, 88))
 	_draw_ui_card(audio_rect, Color(1, 1, 1, 0.10), UI_PANEL_FILL_SOFT, 1.0)
-	draw_string(ThemeDB.fallback_font, audio_rect.position + Vector2(16, 24), "NOW PLAYING  •  %s" % _current_main_music_title(), HORIZONTAL_ALIGNMENT_LEFT, 278, 15, TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, audio_rect.position + Vector2(16, 24), "NOW PLAYING  •  %s" % _current_main_music_title(), HORIZONTAL_ALIGNMENT_LEFT, 278, 15, TEXT_COLOR)
 	var visualizer_rect := Rect2(audio_rect.position + Vector2(306, 10), Vector2(270, 24))
 	var visualizer_bands := _music_visualizer_bands(18)
 	var visualizer_gap := 3.0
@@ -9023,20 +10242,20 @@ func _draw_inventory_menu() -> void:
 		var band_height: float = maxf(2.0, visualizer_rect.size.y * visualizer_bands[band_index])
 		var band_position := Vector2(visualizer_rect.position.x + float(band_index) * (visualizer_bar_width + visualizer_gap), visualizer_rect.end.y - band_height)
 		var band_color := UI_WARM_ACCENT.lerp(MAGIC_COLOR, float(band_index) / maxf(float(visualizer_bands.size() - 1), 1.0))
-		draw_rect(Rect2(band_position, Vector2(visualizer_bar_width, band_height)), _with_alpha(band_color, 0.88), true)
-	draw_string(ThemeDB.fallback_font, audio_rect.position + Vector2(16, 60), "Music", HORIZONTAL_ALIGNMENT_LEFT, 56, 16, MUTED_TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, audio_rect.position + Vector2(236, 60), "%d%%" % int(round(music_volume_percent)), HORIZONTAL_ALIGNMENT_LEFT, 56, 16, TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, audio_rect.position + Vector2(310, 60), "SFX", HORIZONTAL_ALIGNMENT_LEFT, 40, 16, MUTED_TEXT_COLOR)
-	draw_string(ThemeDB.fallback_font, audio_rect.position + Vector2(532, 60), "%d%%" % int(round(sfx_volume_percent)), HORIZONTAL_ALIGNMENT_LEFT, 48, 16, TEXT_COLOR)
+		_prect(Rect2(band_position, Vector2(visualizer_bar_width, band_height)), _with_alpha(band_color, 0.88), true)
+	_pstr(ThemeDB.fallback_font, audio_rect.position + Vector2(16, 60), "Music", HORIZONTAL_ALIGNMENT_LEFT, 56, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, audio_rect.position + Vector2(236, 60), "%d%%" % int(round(music_volume_percent)), HORIZONTAL_ALIGNMENT_LEFT, 56, 16, TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, audio_rect.position + Vector2(310, 60), "SFX", HORIZONTAL_ALIGNMENT_LEFT, 40, 16, MUTED_TEXT_COLOR)
+	_pstr(ThemeDB.fallback_font, audio_rect.position + Vector2(532, 60), "%d%%" % int(round(sfx_volume_percent)), HORIZONTAL_ALIGNMENT_LEFT, 48, 16, TEXT_COLOR)
 
 	if dev_mode_enabled:
 		var dev_rect := Rect2(panel_rect.position + Vector2(26, 438), Vector2(592, 38))
 		_draw_ui_card(dev_rect, MAGIC_COLOR, Color(0.10, 0.07, 0.14, 0.98), 2.0, Vector2.ZERO)
-		draw_string(ThemeDB.fallback_font, dev_rect.position + Vector2(204, 25), "Simulation speed", HORIZONTAL_ALIGNMENT_LEFT, 130, 14, MUTED_TEXT_COLOR)
+		_pstr(ThemeDB.fallback_font, dev_rect.position + Vector2(204, 25), "Simulation speed", HORIZONTAL_ALIGNMENT_LEFT, 130, 14, MUTED_TEXT_COLOR)
 	else:
 		var tip_rect := Rect2(panel_rect.position + Vector2(26, 450), Vector2(592, 18))
 		_draw_ui_card(tip_rect, Color(1, 1, 1, 0.08), Color(0.10, 0.12, 0.14, 1.0), 1.0, Vector2.ZERO)
-		draw_string(ThemeDB.fallback_font, tip_rect.position + Vector2(14, 14), "Materials stay here until a build or trade needs them.", HORIZONTAL_ALIGNMENT_LEFT, 560, 14, MUTED_TEXT_COLOR)
+		_pstr(ThemeDB.fallback_font, tip_rect.position + Vector2(14, 14), "Materials stay here until a build or trade needs them.", HORIZONTAL_ALIGNMENT_LEFT, 560, 14, MUTED_TEXT_COLOR)
 
 
 func _open_credit_url(url: String) -> void:
@@ -9128,8 +10347,8 @@ func _build_hud() -> void:
 	menu_tutorial_button = Button.new()
 	menu_tutorial_button.position = Vector2(326, 442)
 	menu_tutorial_button.size = Vector2(300, 48)
-	menu_tutorial_button.text = "Guided Tutorial: On"
-	_style_action_button(menu_tutorial_button, UI_SUCCESS_ACCENT)
+	menu_tutorial_button.text = "[x]  Guided tutorial"
+	_style_paper_checkbox(menu_tutorial_button)
 	menu_tutorial_button.pressed.connect(_on_menu_tutorial_pressed)
 	menu_panel.add_child(menu_tutorial_button)
 
@@ -9137,9 +10356,18 @@ func _build_hud() -> void:
 	menu_dev_button.position = Vector2(810, 18)
 	menu_dev_button.size = Vector2(124, 40)
 	menu_dev_button.text = "Dev Tools"
-	_style_action_button(menu_dev_button, MAGIC_COLOR)
+	menu_dev_button.tooltip_text = "Dev Mode (PIN protected)"
+	_style_menu_art_button(menu_dev_button, MENU_UI_DEV_MODE_REGION)
 	menu_dev_button.pressed.connect(_on_menu_dev_pressed)
 	menu_panel.add_child(menu_dev_button)
+
+	menu_leaderboard_button = Button.new()
+	menu_leaderboard_button.position = Vector2(796, 18)
+	menu_leaderboard_button.size = Vector2(142, 40)
+	menu_leaderboard_button.text = "Leaderboard"
+	_style_action_button(menu_leaderboard_button, UI_WARM_ACCENT)
+	menu_leaderboard_button.pressed.connect(_on_menu_leaderboard_pressed)
+	menu_panel.add_child(menu_leaderboard_button)
 
 	menu_credits_button = Button.new()
 	menu_credits_button.position = Vector2(18, 18)
@@ -9708,11 +10936,104 @@ func _build_hud() -> void:
 	overlay_label.modulate = TEXT_COLOR
 	add_child(overlay_label)
 
+	_build_revive_offer_ui()
 	_apply_audio_settings()
+
+
+func _build_revive_offer_ui() -> void:
+	revive_offer_panel = ColorRect.new()
+	revive_offer_panel.name = "ReviveOffer"
+	revive_offer_panel.position = Vector2.ZERO
+	revive_offer_panel.size = SCREEN_SIZE
+	revive_offer_panel.color = Color(0.01, 0.012, 0.016, 0.88)
+	revive_offer_panel.mouse_filter = Control.MOUSE_FILTER_STOP
+	revive_offer_panel.z_index = 120
+	revive_offer_panel.z_as_relative = false
+	revive_offer_panel.visible = false
+	add_child(revive_offer_panel)
+
+	var offer_card := Panel.new()
+	offer_card.name = "OfferCard"
+	offer_card.position = Vector2(298, 146)
+	offer_card.size = Vector2(684, 428)
+	offer_card.add_theme_stylebox_override("panel", _make_flat_style(Color(0.04, 0.045, 0.055, 0.98), Color(0.96, 0.76, 0.34, 0.78), 2, 16))
+	revive_offer_panel.add_child(offer_card)
+
+	var sponsor_label := Label.new()
+	sponsor_label.position = Vector2(42, 30)
+	sponsor_label.size = Vector2(600, 26)
+	sponsor_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	sponsor_label.add_theme_font_size_override("font_size", 15)
+	sponsor_label.modulate = Color(0.78, 0.78, 0.78)
+	sponsor_label.text = "A MESSAGE FROM LETERNAME TECHNOLOGIES"
+	offer_card.add_child(sponsor_label)
+
+	var offer_title := Label.new()
+	offer_title.position = Vector2(42, 70)
+	offer_title.size = Vector2(600, 58)
+	offer_title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	offer_title.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	offer_title.add_theme_font_size_override("font_size", 36)
+	offer_title.modulate = UI_WARM_ACCENT
+	offer_title.text = "RESTORE BOB'S ASSETS?"
+	offer_card.add_child(offer_title)
+
+	var offer_body := Label.new()
+	offer_body.position = Vector2(70, 134)
+	offer_body.size = Vector2(544, 108)
+	offer_body.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	offer_body.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	offer_body.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	offer_body.add_theme_font_size_override("font_size", 19)
+	offer_body.modulate = TEXT_COLOR
+	offer_body.text = "Watch one 30-second sponsored presentation to restore the trophy,\nrepair Bob and his defenses, and clear this round.\nOne offer per run."
+	offer_card.add_child(offer_body)
+
+	revive_offer_countdown_label = Label.new()
+	revive_offer_countdown_label.position = Vector2(100, 258)
+	revive_offer_countdown_label.size = Vector2(484, 32)
+	revive_offer_countdown_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	revive_offer_countdown_label.add_theme_font_size_override("font_size", 19)
+	revive_offer_countdown_label.modulate = UI_DANGER_ACCENT
+	revive_offer_countdown_label.text = "Offer expires in 10"
+	offer_card.add_child(revive_offer_countdown_label)
+
+	revive_offer_watch_button = Button.new()
+	revive_offer_watch_button.name = "WatchAd"
+	revive_offer_watch_button.position = Vector2(70, 308)
+	revive_offer_watch_button.size = Vector2(260, 62)
+	revive_offer_watch_button.text = "WATCH AD  •  REVIVE"
+	revive_offer_watch_button.focus_mode = Control.FOCUS_ALL
+	_style_action_button(revive_offer_watch_button, UI_SUCCESS_ACCENT)
+	revive_offer_watch_button.pressed.connect(_accept_revive_offer)
+	offer_card.add_child(revive_offer_watch_button)
+
+	revive_offer_decline_button = Button.new()
+	revive_offer_decline_button.name = "Decline"
+	revive_offer_decline_button.position = Vector2(354, 308)
+	revive_offer_decline_button.size = Vector2(260, 62)
+	revive_offer_decline_button.text = "DECLINE"
+	revive_offer_decline_button.focus_mode = Control.FOCUS_ALL
+	_style_action_button(revive_offer_decline_button, UI_DANGER_ACCENT)
+	revive_offer_decline_button.pressed.connect(_decline_revive_offer.bind("The offer was declined."))
+	offer_card.add_child(revive_offer_decline_button)
+
+	var disclosure := Label.new()
+	disclosure.position = Vector2(44, 384)
+	disclosure.size = Vector2(596, 24)
+	disclosure.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	disclosure.add_theme_font_size_override("font_size", 12)
+	disclosure.modulate = MUTED_TEXT_COLOR
+	disclosure.text = "In-game presentation • no network request • no download • no purchase"
+	offer_card.add_child(disclosure)
 
 
 func _refresh_hud() -> void:
 	escape_confirm_panel.visible = escape_confirm_open
+	if revive_offer_panel != null:
+		revive_offer_panel.visible = revive_offer_visible
+	if revive_offer_countdown_label != null and revive_offer_visible:
+		revive_offer_countdown_label.text = "Offer expires in %02d" % int(ceili(revive_offer_countdown))
 	if escape_confirm_open:
 		escape_confirm_title_label.text = escape_confirm_title
 		escape_confirm_body_label.text = escape_confirm_body
@@ -9739,33 +11060,38 @@ func _refresh_hud() -> void:
 			var show_menu_home := not menu_credits_open and not menu_settings_open and not dev_mode_prompt_open
 			menu_panel.color = Color(0.03, 0.05, 0.07, 0.70)
 			menu_title_label.visible = show_menu_home
-			menu_desc_label.visible = show_menu_home
+			# Player pick: the menu shows only the title and buttons, no help text.
+			menu_desc_label.visible = false
 			menu_start_button.visible = show_menu_home
 			menu_settings_button.visible = show_menu_home
 			menu_tutorial_button.visible = show_menu_home
 			menu_dev_button.visible = show_menu_home and dev_tools_available
+			menu_leaderboard_button.visible = show_menu_home
 			menu_credits_button.visible = show_menu_home
-			menu_continue_hint_label.visible = show_menu_home
+			menu_continue_hint_label.visible = show_menu_home and dev_mode_enabled
+			_layout_menu_home(150.0, dev_tools_available)
 			title_label.visible = false
 			hud_heart_icon.visible = false
 			stats_label.visible = false
 			stats_label.text = ""
 			hint_label.visible = false
 			menu_panel.visible = true
-			menu_info_label.visible = show_menu_home
+			menu_info_label.visible = false
 			menu_state_badge_label.visible = false
 			menu_title_label.text = "TAX SEASON SIEGE"
 			menu_desc_label.text = "Defend Bob's house from the IRS.\nGather fast. Build smarter. Keep the suspicious air fryer."
 			menu_info_label.text = "Tutorial hints appear only when useful.\nLeft stick move  •  A attack  •  Y build  •  Back inventory" if _using_controller_prompts() else "Tutorial hints appear only when useful.\nWASD move  •  Click/Space attack  •  B build  •  E inventory"
 			menu_start_button.text = "" if menu_ui_texture != null else "New Game"
+			menu_start_button.disabled = false
 			menu_settings_button.text = "" if menu_ui_texture != null else "Settings"
-			menu_tutorial_button.text = "Guided Tutorial: %s" % ("On" if tutorial_enabled else "Off")
-			menu_dev_button.text = "Dev On" if dev_mode_enabled else "Dev Tools"
+			menu_tutorial_button.text = ("[x]" if tutorial_enabled else "[  ]") + "  Guided tutorial"
+			menu_dev_button.text = "" if menu_ui_texture != null else ("Dev On" if dev_mode_enabled else "Dev Tools")
+			menu_dev_button.self_modulate = Color(1.15, 1.05, 1.25) if dev_mode_enabled else Color.WHITE
 			menu_dev_button.disabled = false
 			menu_dev_panel.visible = dev_mode_prompt_open and not menu_credits_open
 			menu_settings_panel.visible = menu_settings_open and not dev_mode_prompt_open and not menu_credits_open
 			menu_credits_panel.visible = menu_credits_open
-			menu_continue_hint_label.text = "Press Esc or Back to return." if menu_credits_open else (("DEV MODE ON  |  " if dev_mode_enabled else "") + "Press Space, Enter, or click New Game.")
+			menu_continue_hint_label.text = "DEV MODE ON"
 			overlay_label.visible = false
 		Phase.BUILD:
 			menu_state_badge_label.visible = false
@@ -9831,23 +11157,26 @@ func _refresh_hud() -> void:
 			overlay_label.visible = false
 		Phase.GAME_OVER:
 			var show_game_over_home := not menu_credits_open and not menu_settings_open and not dev_mode_prompt_open
-			menu_panel.color = Color(0.045, 0.035, 0.035, 0.84)
-			menu_title_label.visible = show_game_over_home
-			menu_desc_label.visible = show_game_over_home
+			menu_panel.color = Color(0, 0, 0, 0)
+			# Player pick: art first, run stats on the drawn IRS receipt.
+			menu_title_label.visible = false
+			menu_desc_label.visible = false
 			menu_start_button.visible = show_game_over_home
 			menu_settings_button.visible = show_game_over_home
 			menu_tutorial_button.visible = show_game_over_home
 			menu_dev_button.visible = show_game_over_home and dev_tools_available
+			menu_leaderboard_button.visible = show_game_over_home
 			menu_credits_button.visible = show_game_over_home
-			menu_continue_hint_label.visible = show_game_over_home
+			menu_continue_hint_label.visible = false
+			_layout_game_over_home(dev_tools_available)
 			title_label.visible = false
 			hud_heart_icon.visible = false
 			stats_label.visible = false
 			stats_label.text = ""
 			hint_label.visible = false
 			menu_panel.visible = true
-			menu_info_label.visible = show_game_over_home
-			menu_state_badge_label.visible = show_game_over_home
+			menu_info_label.visible = false
+			menu_state_badge_label.visible = false
 			menu_state_badge_label.text = "ASSET SEIZED"
 			menu_state_badge_label.add_theme_color_override("font_color", UI_DANGER_ACCENT)
 			menu_title_label.text = "THE CONSOLE IS GONE"
@@ -9856,9 +11185,11 @@ func _refresh_hud() -> void:
 			menu_desc_label.text = "The IRS repossessed Bob's treasured air fryer.\nSURVIVED %d ROUNDS  •  DEFEATED %d AGENTS  •  BEST %d\nGathered %d  •  Built %d  •  Run %d:%02d" % [maxi(round_number - 1, 0), run_enemies_defeated, highest_round, run_resources_gathered, run_structures_built, run_minutes, run_seconds]
 			menu_info_label.text = "%s\nRepairs %d  •  Cave rooms %d  •  Boss %s" % [game_over_taunt if game_over_taunt != "" else String(IRS_DEFEAT_TAUNTS[0]), run_repairs_completed, cave_seen_rooms.size(), "defeated" if cave_boss_defeated else "still collecting interest"]
 			menu_start_button.text = "" if menu_ui_texture != null else "New Game"
+			menu_start_button.disabled = revive_offer_pending or revive_offer_visible or ad_in_progress
 			menu_settings_button.text = "" if menu_ui_texture != null else "Settings"
-			menu_tutorial_button.text = "Guided Tutorial: %s" % ("On" if tutorial_enabled else "Off")
-			menu_dev_button.text = "Dev On" if dev_mode_enabled else "Dev Tools"
+			menu_tutorial_button.text = ("[x]" if tutorial_enabled else "[  ]") + "  Guided tutorial"
+			menu_dev_button.text = "" if menu_ui_texture != null else ("Dev On" if dev_mode_enabled else "Dev Tools")
+			menu_dev_button.self_modulate = Color(1.15, 1.05, 1.25) if dev_mode_enabled else Color.WHITE
 			menu_dev_button.disabled = false
 			menu_dev_panel.visible = dev_mode_prompt_open and not menu_credits_open
 			menu_settings_panel.visible = menu_settings_open and not dev_mode_prompt_open and not menu_credits_open

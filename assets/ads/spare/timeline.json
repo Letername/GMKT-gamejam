@@ -1,0 +1,103 @@
+{
+  "beats": [
+    {
+      "id": "spare_01",
+      "start": 0.0,
+      "duration": 5.531125,
+      "voice_duration": 5.04,
+      "audio": "res://assets/ads/spare/audio/spare_01.wav",
+      "text": "Meet Spare. The budgeting app that takes your money, and the responsibility of having it."
+    },
+    {
+      "id": "spare_02",
+      "start": 5.531125,
+      "duration": 5.4983125,
+      "voice_duration": 4.13,
+      "audio": "res://assets/ads/spare/audio/spare_02.wav",
+      "text": "Select ‘Make my money work.’ We’ll put it straight to work."
+    },
+    {
+      "id": "customer_01",
+      "start": 11.0294375,
+      "duration": 2.21,
+      "voice_duration": 1.46,
+      "audio": "res://assets/ads/spare/audio/customer_01.wav",
+      "text": "Working where?"
+    },
+    {
+      "id": "spare_03",
+      "start": 13.2394375,
+      "duration": 4.451125,
+      "voice_duration": 3.96,
+      "audio": "res://assets/ads/spare/audio/spare_03.wav",
+      "text": "In our account. Look at that growth. You’re doing wonderfully."
+    },
+    {
+      "id": "spare_04",
+      "start": 17.6905625,
+      "duration": 6.633166666666667,
+      "voice_duration": 5.118666666666667,
+      "audio": "res://assets/ads/spare/audio/spare_04.wav",
+      "text": "Spending Protection moves your money before you can waste on unnecessary purchases."
+    },
+    {
+      "id": "customer_02",
+      "start": 24.323729166666666,
+      "duration": 2.494,
+      "voice_duration": 1.744,
+      "audio": "res://assets/ads/spare/audio/customer_02.wav",
+      "text": "I was buying lunch."
+    },
+    {
+      "id": "spare_05",
+      "start": 26.817729166666666,
+      "duration": 3.3644583333333333,
+      "voice_duration": 2.8733333333333335,
+      "audio": "res://assets/ads/spare/audio/spare_05.wav",
+      "text": "And now you’re not. Purchase prevented."
+    },
+    {
+      "id": "spare_06",
+      "start": 30.1821875,
+      "duration": 8.756625,
+      "voice_duration": 6.657333333333334,
+      "audio": "res://assets/ads/spare/audio/spare_06.wav",
+      "text": "Smart Budget handles the rest. Rent. Groceries. Savings. All automatically allocated to Letername."
+    },
+    {
+      "id": "customer_03",
+      "start": 38.9388125,
+      "duration": 3.244666666666667,
+      "voice_duration": 2.494666666666667,
+      "audio": "res://assets/ads/spare/audio/customer_03.wav",
+      "text": "So… what’s left for me?"
+    },
+    {
+      "id": "spare_07",
+      "start": 42.183479166666665,
+      "duration": 5.5983125,
+      "voice_duration": 4.717333333333333,
+      "audio": "res://assets/ads/spare/audio/spare_07.wav",
+      "text": "A simpler dashboard. Fewer decisions. And absolutely nothing to overspend."
+    },
+    {
+      "id": "spare_08",
+      "start": 47.78179166666666,
+      "duration": 4.436125,
+      "voice_duration": 3.7013333333333334,
+      "audio": "res://assets/ads/spare/audio/spare_08.wav",
+      "text": "Spare. Financial freedom achieved. For us."
+    },
+    {
+      "id": "spare_09",
+      "start": 52.21791666666667,
+      "duration": 5.982083333333334,
+      "voice_duration": 4.51,
+      "audio": "res://assets/ads/spare/audio/spare_09.wav",
+      "text": "Letername Technologies. We don’t want just some of your money. We want all of it."
+    }
+  ],
+  "duration": 60.0,
+  "endcard_start": 58.2,
+  "subtitle_basis": "Approved script cross-checked against local tiny.en/base.en ASR. Spare04 omits 'it' in both transcripts; accented words and brand spelling follow approved script."
+}

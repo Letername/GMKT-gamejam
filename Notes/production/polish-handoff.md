@@ -167,3 +167,23 @@ Always preserve the dirty working tree and avoid destructive Git operations.
 - Removed the `FORM 1040-BOB` main-menu badge and the correction overlay that covered the team-drawn Settings button.
 - Restored the intended split between menu-only and gameplay music, with immediate song-to-song gameplay advancement and no round gates.
 - Windows standalone `1.3.3` passed release smoke, hidden-renderer visual capture, candidate launch, and final promoted-executable launch with Dummy audio and zero remaining processes. Final SHA-256: `8BCC52E36EC54559AEEB99A393F0B31CFAF8CEF624BE590A8029439C045C68B7`.
+
+## 2026-10-29 visual pick-sheet answers (player-chosen; do not re-ask)
+
+Main menu: keep the dark framed box; title enters with a rubber-stamp slam; team plank buttons tilt-and-grow on hover and squish on click; use the team's purple DEV MODE art for Dev Tools; Guided Tutorial toggle becomes a tax-form checkbox slip; remove all menu help/hint lines; New Game transitions with an iris that closes on the menu and opens on Bob.
+HUD: health stays heart + number but flinches (shake, red flash, screen-edge vignette) on hit; build countdown becomes a shrinking ring; tutorial tips stay as the corner card; Now Playing slides in when a song starts and leaves after a few seconds; wave banner stays the dark bar; damage numbers are chunky, tilted, outlined, with bigger red crits.
+Panels: tax-form paper look (cream, ruled lines, red stamps) for build, dealer, inventory, settings; open with a pop + overshoot; keep big centered size; cards lift on hover; purchases/builds land a red PAID stamp.
+Game over: team death art large and clear, stats on an IRS receipt beside it.
+Global: Pixelify Sans UI font; keep mixed per-button outline colors; UI animation duration about 460 ms (floaty side). Menu camera motion and bounce amount were not answered (agent decides; keep moderate).
+Player note: a leaderboard was added recently; include it in the polish pass.
+
+### Pick-sheet implementation status (2026-10-29)
+
+Done in `scripts/main_runtime.gd`: title stamp slam (`_apply_title_stamp`), help lines removed, team DEV MODE art button, paper checkbox tutorial toggle, stacked plank layout (`_layout_menu_home`), leaderboard button moved inside the frame, tilt/grow hover + squish click, iris opening on Bob (`_draw_iris_open`), flinching health + hit vignette, shrinking ring countdown around the team digits, sliding song credit, chunky tilted damage numbers with red crits (`DAMAGE_CRIT_THRESHOLD`), tax-paper panels via `_draw_paper_panels` and the `_pstr/_prect/_pline/_pxform` helpers, Settings paperized (`_paperize_settings_panel`), pop-open panels, hover-lift cards, PAID/SOLD stamps, game-over art-first IRS receipt.
+UI cosmetic timers live outside replay hashing and are settled by hand in `ui_capture_test.gd`.
+Pixelify Sans is applied via `_apply_ui_font` now Silkscreen (`UI_FONT_PATH`; tightened spacing, ligatures off). Pixelify was dropped because its B and 5 read as G and S. Still open: leaderboard panel restyle, menu camera motion choice, export/version bump.
+
+## 2026-10-29 pick-sheet release
+
+- Leaderboard panel restyled to tax-form paper with pop-open; UI font Silkscreen.
+- Windows standalone `1.4.0` (exe version only; `REPLAY_GAME_VERSION` stays `tax-season-siege-1.3.4` because simulation is unchanged, so shared replays still load). Candidate exported, launched hidden/muted, promoted, relaunched. Previous exe kept as `TaxSeasonSiegeStandalone-1.3.4-backup.exe`. SHA-256: `D45A41D6D166923A7DD1AA9F34178125E94EEBC0D26716AF007E171437312AD4`.

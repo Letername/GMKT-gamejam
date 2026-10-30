@@ -1,11 +1,22 @@
-[gd_scene load_steps=4 format=3 uid="uid://ce7l3cey8pf1r"]
+[gd_scene load_steps=6 format=3 uid="uid://ce7l3cey8pf1r"]
 
 [ext_resource type="Script" path="res://scripts/main_runtime.gd" id="1_5obkw"]
 [ext_resource type="PackedScene" path="res://scenes/visuals/player_visual.tscn" id="2_0k8y8"]
 [ext_resource type="PackedScene" path="res://scenes/visuals/dealer_visual.tscn" id="3_uh13t"]
+[ext_resource type="Script" path="res://scripts/world/ground_layer.gd" id="4_grnd1"]
+[ext_resource type="Script" path="res://scripts/world/world_sprites.gd" id="5_wrld1"]
 
 [node name="CountdownGauntlet" type="Node2D"]
 script = ExtResource("1_5obkw")
+
+[node name="GroundLayer" type="Node2D" parent="."]
+z_index = -400
+z_as_relative = false
+script = ExtResource("4_grnd1")
+
+[node name="WorldSpriteLayer" type="Node2D" parent="."]
+z_as_relative = false
+script = ExtResource("5_wrld1")
 
 [node name="VisualLayer" type="Node2D" parent="."]
 

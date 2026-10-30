@@ -27,3 +27,8 @@ No stock, web-downloaded, marketplace, or third-party raster artwork is loaded b
 The gameplay loader points character, enemy, boss, animal, environment, resource, structure, projectile, item, icon, and interface textures directly at `Art/`. Historical duplicates under `assets/` are not used where a direct team source exists. `assets/player_reference.png` is intentionally not loaded.
 
 The release audit is enforced by `scripts/tests/release_candidate_smoke_test.gd`, which rejects unexpected texture roots and verifies every required runtime derivative is present.
+
+## UI font
+
+- `assets/fonts/PixelifySans.ttf`: Pixelify Sans by the Pixelify Sans Project Authors, SIL Open Font License 1.1 (`assets/fonts/PixelifySans-OFL.txt`), downloaded 2026-10-29 from github.com/google/fonts. Not team art; chosen by the player for UI text.
+- `assets/fonts/Silkscreen-Regular.ttf`: Silkscreen by the Silkscreen Project Authors, SIL Open Font License 1.1 (`assets/fonts/Silkscreen-OFL.txt`), downloaded 2026-10-29. Current UI font; Pixelify is kept on disk but unused.

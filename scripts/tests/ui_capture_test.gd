@@ -261,6 +261,14 @@ func _run() -> void:
 func _capture(main_scene: Node, capture_name: String) -> void:
 	main_scene._sync_visual_nodes()
 	main_scene._refresh_hud()
+	# Processing is paused for stable frames, so settle one-shot UI motion by hand.
+	main_scene.iris_open_timer = 0.0
+	main_scene._apply_title_stamp(main_scene.menu_title_label, 99.0)
+	main_scene.hp_flinch_timer = 0.0
+	main_scene.music_credit_panel.position.x = 886.0
+	main_scene.ui_stamps.clear()
+	main_scene.ui_panel_was_open = main_scene.dealer_menu_open or main_scene.build_menu_open or main_scene.inventory_menu_open
+	main_scene.ui_panel_open_elapsed = 99.0
 	main_scene.queue_redraw()
 	for frame_index in range(4):
 		await process_frame
